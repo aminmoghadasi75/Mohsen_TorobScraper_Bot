@@ -1,0 +1,33 @@
+# Credentials and Configuration
+config.py
+credentials.json
+*.json
+!config.py.example
+
+# Python noise
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Data and Sessions
+data/
+*.pkl
+*.cookies
+
+# Debug and Logs
+*.txt
+*.log
+page_source_head.txt
+debug_*.py
+
+# System Noise
+*.Zone.Identifier
+.DS_Store
+.idea/
+.vscode/
+
+# SCRAPER SPECIFIC
+chromedriver
+browser_profile/

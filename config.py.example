@@ -1,0 +1,74 @@
+import os
+
+# Google Sheets Configuration
+SPREADSHEET_ID = "1JkKeaRuOXabLs917EQu-TaJgXzSn7BSxtWsIVHoF62Y"
+CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
+
+# Column Names (New Structure)
+COL_PRODUCT_NAME = "نام محصول"
+COL_PURCHASE_COST = "قیمت تمام شده خرید"
+COL_SITE_PRICE = "قیمت سایت"
+COL_TOROB_PRICE = "قیمت ترب"
+COL_SHOP_NAME = "اسم فروشگاه"
+COL_PRODUCT_URL = "لینک محصول"
+COL_IMAGE_URL = "عکس محصول"
+COL_TELEGRAM_MSG_ID = "ID پیام تلگرام" # New column to prevent duplicates
+COL_ADMIN_NAME = "نام ادمین"
+COL_SECOND_TOROB_PRICE = "قیمت دوم ترب"
+COL_SECOND_SHOP_NAME = "اسم فروشگاه دوم"
+
+# Order of columns
+SHEET_COLUMNS = [
+    COL_PRODUCT_NAME,
+    COL_PURCHASE_COST,
+    COL_SITE_PRICE,
+    COL_TOROB_PRICE,
+    COL_SHOP_NAME,
+    COL_PRODUCT_URL,
+    COL_IMAGE_URL,
+    COL_TELEGRAM_MSG_ID,
+    COL_ADMIN_NAME,
+    COL_SECOND_TOROB_PRICE,
+    COL_SECOND_SHOP_NAME
+]
+
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+SUPER_ADMIN_ID = 0  # Your Telegram User ID
+ADMIN_CHAT_ID = "0" 
+SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "data", "settings.json")
+
+# Pricing Logic
+PRICE_DIFF_GOAL = 100000 
+
+# Gerishmall Configuration
+GERISHMALL_URL = "https://your-site.com/"
+GERISHMALL_LOGIN_URL = "https://your-site.com/wp-admin/"
+GERISHMALL_ADMIN_URL = "https://your-site.com/wp-admin/"
+GERISHMALL_ADMIN_PHONE = "09..."
+WC_CONSUMER_KEY = "ck_your_key_here"
+WC_CONSUMER_SECRET = "cs_your_secret_here"
+MY_SHOP_NAME = "گریش مال"
+
+# Selenium Configuration
+HEADLESS = True
+PAGE_LOAD_STRATEGY = 'eager'
+WAIT_TIMEOUT = 10
+REDIRECT_TIMEOUT = 30
+# Logging Configuration
+LOGS_SHEET_NAME = "Logs"
+LOG_COL_ADMIN = "نام ادمین"
+LOG_COL_DATE = "تاریخ"
+LOG_COL_TIME = "ساعت"
+LOG_COL_PRODUCT = "نام محصول"
+LOG_COL_OLD_PRICE = "قیمت قبلی"
+LOG_COL_NEW_PRICE = "قیمت جدید"
+
+LOG_COLUMNS = [
+    LOG_COL_ADMIN,
+    LOG_COL_DATE,
+    LOG_COL_TIME,
+    LOG_COL_PRODUCT,
+    LOG_COL_OLD_PRICE,
+    LOG_COL_NEW_PRICE
+]
