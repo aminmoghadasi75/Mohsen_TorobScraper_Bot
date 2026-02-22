@@ -156,7 +156,7 @@ class PriceUpdateBot:
                 # RECORD AUDIT LOG
                 shamsi_now = jdatetime.datetime.now()
                 date_str = shamsi_now.strftime("%Y/%m/%d")
-                time_str = shamsi_now.strftime("%H:%M:%S")
+                time_str = f"'{shamsi_now.strftime('%H:%M:%S')}" # Prepend ' so sheets parses as text
                 await loop.run_in_executor(
                     executor, 
                     self.sheets.append_log, 
@@ -741,8 +741,10 @@ class PriceUpdateBot:
             diff = suggestion - site_price
             if diff > 0:
                 diff_display = f" {diff:,}⬆️ (+)"
+                suggestion_icon = "🟢"
             else:
                 diff_display = f" {abs(diff):,}⬇️ (-)"
+                suggestion_icon = "🔴"
 
             alert_data = {
                 'name': product_name,
@@ -751,6 +753,7 @@ class PriceUpdateBot:
                 'torob_price': benchmark_price, # Benchmark instead of our own price
                 'site_price': site_price,
                 'suggestion': suggestion,
+                'suggestion_icon': suggestion_icon,
                 'diff_display': diff_display,
                 'status_note': status_note,
                 'row_index': current_row,
@@ -995,8 +998,8 @@ class PriceUpdateBot:
                 # Format: Who, Date, Time, Product, Old -> New
                 admin = log.get(config.LOG_COL_ADMIN, "ناشناس")
                 date = log.get(config.LOG_COL_DATE, "")
-                time_val = log.get(config.LOG_COL_TIME, "")
-                product = log.get(config.LOG_COL_PRODUCT, "محصول")
+                time_val = str(log.get(config.LOG_COL_TIME, ""))
+                product = log.get(config.LOG_COL_PRODUCT) or log.get("نام محصول") or "محصول"
                 old_p = log.get(config.LOG_COL_OLD_PRICE, 0)
                 new_p = log.get(config.LOG_COL_NEW_PRICE, 0)
                 
@@ -1031,7 +1034,7 @@ class PriceUpdateBot:
             f"💰 <b>قیمت خرید:</b> <code>{product_data['purchase_cost']:,}</code> تومان\n"
             f"💻 <b>قیمت گریش مال:</b> <code>{product_data['site_price']:,}</code> تومان\n"
             f"🔍 <b>قیمت ترب:</b> <code>{product_data['torob_price']:,}</code> تومان\n\n"
-            f"✨ <b>قیمت پیشنهادی:</b> 🟢 <code>{product_data['suggestion']:,}</code> تومان\n"
+            f"✨ <b>قیمت پیشنهادی:</b> {product_data.get('suggestion_icon', '🟢')} <code>{product_data['suggestion']:,}</code> تومان\n"
             f"📊 <b>مقدار تغییر:</b> <code>{product_data['diff_display']}</code>\n"
             f"━━━━━━━━━━━━━━\n"
             f"👆 <i>{product_data['status_note']} قیمت پیشنهادی بر اساس {config.PRICE_DIFF_GOAL:,} تومان ارزان‌تر از رقیب محاسبه شده است.</i>"
