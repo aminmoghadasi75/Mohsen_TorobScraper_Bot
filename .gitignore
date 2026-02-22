@@ -18,6 +18,7 @@ data/
 
 # Debug and Logs
 *.txt
+!requirements.txt
 *.log
 page_source_head.txt
 debug_*.py

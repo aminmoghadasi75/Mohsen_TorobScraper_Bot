@@ -11,6 +11,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium_stealth import stealth
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import random
 
 from scrapers.base_scraper import BaseScraper
 import config
@@ -18,7 +21,8 @@ import pickle
 import os
 
 class TorobScraper(BaseScraper):
-    def __init__(self):
+    def __init__(self, captcha_callback=None):
+        self.captcha_callback = captcha_callback
         self.driver = self._init_driver()
         self.wait = WebDriverWait(self.driver, config.WAIT_TIMEOUT)
         self.cookies_file = "torob_cookies.pkl"
@@ -75,7 +79,14 @@ class TorobScraper(BaseScraper):
             "profile.managed_default_content_settings.stylesheets": 2, # Optional: Block CSS? User asked for "heavy CSS", blocking all CSS might break some JS-heavy sites though.
             "profile.default_content_setting_values.geolocation": 2,
         }
-        chrome_options.add_experimental_option("prefs", prefs)
+        # Human-like User-Agents list
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0"
+        ]
+        chrome_options.add_argument(f"user-agent={random.choice(user_agents)}")
         
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
@@ -97,6 +108,7 @@ class TorobScraper(BaseScraper):
                 webgl_vendor="Intel Inc.",
                 renderer="Intel Iris OpenGL Engine",
                 fix_hairline=True,
+                run_on_insecure_origins=False
         )
         return driver
 
@@ -195,25 +207,55 @@ class TorobScraper(BaseScraper):
                 time.sleep(1)
             except: pass
 
-            # Extract Sellers
-            sellers = []
-            seller_cards = self.driver.find_elements(By.CSS_SELECTOR, ".shop-card.seller-element")
-            if not seller_cards:
-                seller_cards = self.driver.find_elements(By.XPATH, "//div[contains(@class, 'shop-card')]")
-
-            for card in seller_cards:
-                try:
-                    if "آگهی" in card.text: continue
-                    name = card.find_element(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']").text.strip()
-                    price_txt = card.find_element(By.CSS_SELECTOR, ".price, [class*='price']").text
-                    price_val = int(re.search(r'(\d+)', self.normalize_digits(price_txt)).group(1))
+            # --- Seller Extraction with "Show More" handling ---
+            def extract_sellers_data():
+                found_sellers = []
+                local_shop_name = None
+                
+                cards_list = self.driver.find_elements(By.CSS_SELECTOR, ".shop-card.seller-element") or \
+                             self.driver.find_elements(By.XPATH, "//div[contains(@class, 'shop-card')]")
+                
+                for card in cards_list:
                     try:
-                        buy_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
-                    except:
-                        buy_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
+                        if "آگهی" in card.text: continue
+                        s_name = card.find_element(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']").text.strip()
+                        
+                        # Extract shop-specific product name if this is our shop
+                        if s_name == config.MY_SHOP_NAME:
+                            try:
+                                p_name_el = card.find_element(By.CSS_SELECTOR, ".product-name, [class*='product-name']")
+                                local_shop_name = p_name_el.text.strip()
+                            except: pass
 
-                    sellers.append({'name': name, 'price': price_val, 'btn': buy_btn})
-                except: continue
+                        p_txt = card.find_element(By.CSS_SELECTOR, ".price, [class*='price']").text
+                        p_val = int(re.search(r'(\d+)', self.normalize_digits(p_txt)).group(1))
+                        try:
+                            b_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
+                        except:
+                            b_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
+
+                        found_sellers.append({'name': s_name, 'price': p_val, 'btn': b_btn})
+                    except: continue
+                return found_sellers, local_shop_name
+
+            # Initial extraction
+            sellers, shop_product_name = extract_sellers_data()
+
+            # If shop name not found or we need to ensure we see everyone, click "Show More"
+            try:
+                # Scroll to bottom to trigger button visibility
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(1)
+                
+                show_more = self.driver.find_elements(By.CSS_SELECTOR, ".show-more-btn, [class*='show-more-btn']")
+                if show_more:
+                    print(f"🔗 Clicking 'Show More Sellers' to find {config.MY_SHOP_NAME}...")
+                    self.driver.execute_script("arguments[0].click();", show_more[0])
+                    time.sleep(2)
+                    # Re-extract if we clicked
+                    sellers, shop_product_name = extract_sellers_data()
+            except Exception as e:
+                print(f"⚠️ Note: Could not expand sellers list: {e}")
 
             if not sellers:
                 return None
@@ -223,13 +265,17 @@ class TorobScraper(BaseScraper):
             cheapest = sellers[0]
             second_cheapest = sellers[1] if len(sellers) > 1 else None
             
-            # Follow redirects for top 2 competitors
-            final_url = self._follow_redirect(cheapest['btn'])
-            second_final_url = self._follow_redirect(second_cheapest['btn']) if second_cheapest else None
+            # Skip the slow follow_redirect for speed
+            # final_url = self._follow_redirect(cheapest['btn'])
+            # second_final_url = self._follow_redirect(second_cheapest['btn']) if second_cheapest else None
+            # Just use the redirect URL directly or torob link
+            final_url = cheapest['btn'].get_attribute("href") if cheapest.get('btn') else ""
+            second_final_url = second_cheapest['btn'].get_attribute("href") if second_cheapest and second_cheapest.get('btn') else ""
 
             return {
                 'price': cheapest['price'],
                 'shop_name': cheapest['name'],
+                'shop_product_name': shop_product_name,
                 'second_price': second_cheapest['price'] if second_cheapest else None,
                 'second_shop_name': second_cheapest['name'] if second_cheapest else None,
                 'product_url': final_url,
@@ -321,6 +367,9 @@ class TorobScraper(BaseScraper):
                 # 2. Check for Puzzle (Slider) or persistent captcha
                 # Re-check page source after potential checkbox click
                 if "با کشیدن فلش" in self.driver.page_source or "puzzle" in self.driver.page_source or "captcha" in self.driver.current_url:
+                    if self.captcha_callback:
+                        self.captcha_callback()
+
                     print("\n" + "="*50)
                     print("🧩 PUZZLE DETECTED! SCRIPT PAUSED.")
                     print("👉 Please SOLVE THE PUZZLE MANUALLY in the browser window.")
@@ -372,41 +421,69 @@ class TorobScraper(BaseScraper):
         if self.driver:
             self.driver.quit()
 
-    def get_shop_products(self, shop_url, progress_callback=None):
+    def get_shop_products(self, shop_url, progress_callback=None, captcha_callback=None):
         """
         Scrapes all products with a callback for progress updates.
         Ensures all products (e.g., 39) are loaded via infinite scroll.
         """
+        if captcha_callback:
+            self.captcha_callback = captcha_callback
+            
         try:
             self.driver.get(shop_url)
             time.sleep(3)
             self._handle_captcha(shop_url)
 
-            # 🛠 Enhanced Robust Scrolling for Infinite Load
-            # 🛠 Step-Scrolling Logic for Infinite Load
-            for pass_idx in range(3): # Scroll to end 3 times as requested
-                print(f"🔄 Starting scroll pass {pass_idx + 1}...")
-                last_height = self.driver.execute_script("return document.body.scrollHeight")
-                current_count = len(self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']"))
+            # 🛠 Precise Scrolling Logic (Targeting product container)
+            max_scroll_retries = 5
+            scroll_retry = 0
+            
+            while True:
+                cards = self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']")
+                previous_count = len(cards)
+                print(f"📊 Current product count: {previous_count}")
                 
-                # Step scroll down to trigger observers
-                current_pos = 0
-                while True:
-                    current_pos += 900
-                    self.driver.execute_script(f"window.scrollTo(0, {current_pos});")
-                    time.sleep(0.6)
-                    new_height = self.driver.execute_script("return document.body.scrollHeight")
-                    if current_pos >= new_height:
+                if previous_count > 0:
+                    # Scroll the LAST product card into view to trigger lazy loading
+                    try:
+                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cards[-1])
+                        time.sleep(1.5)
+                        # Also scroll slightly more to ensure trigger
+                        self.driver.execute_script("window.scrollBy(0, 300);")
+                        time.sleep(1)
+                    except:
+                        self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                else:
+                    # Initial load might be slow or blocked
+                    print(f"⚠️ No products found yet. Scroll retry {scroll_retry+1}/{max_scroll_retries}...")
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(3)
+                    scroll_retry += 1
+                    if scroll_retry < max_scroll_retries:
+                        continue
+                    else:
+                        # Check if it's a captcha
+                        if "captcha" in self.driver.current_url or "ربات" in self.driver.page_source:
+                            print("❌ Stuck on CAPTCHA page. Cannot find products.")
                         break
                 
-                # Final jump to bottom and wait for render
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(4)
-                
+                # Check if new products loaded
                 current_count = len(self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']"))
-                print(f"📊 Scroll pass {pass_idx + 1}: Found {current_count} products.")
+                print(f"📊 New product count: {current_count}")
                 
-                if current_count >= 39: break # Early exit if all 39 found
+                if current_count > previous_count:
+                    print(f"🔄 {current_count - previous_count} new products loaded. Continuing scroll...")
+                    scroll_retry = 0 # Reset retry if we made progress
+                    continue
+                else:
+                    # Try one last deep scroll just in case
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+                    final_count = len(self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']"))
+                    if final_count > current_count:
+                        continue
+                    print("🏁 All products loaded.")
+                    break
             all_cards = self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']")
             product_links = []
             seen_urls = set()
@@ -423,82 +500,167 @@ class TorobScraper(BaseScraper):
                     product_links.append({'name': title, 'url': url, 'shop_site_price': shop_price})
                 except: continue
 
+            if not product_links:
+                print("❌ No product links extracted. Scraper possibly blocked.")
+                return None
+
+            # --- PARALLEL PROCESSING ---
             results = []
             total = len(product_links)
-            
-            for idx, item in enumerate(product_links):
-                attempts = 0
-                while attempts < 3:
-                    try:
-                        if progress_callback:
-                            progress_callback(idx + 1, total, item['name'])
+            completed_count = 0
+            count_lock = threading.Lock()
+
+            def worker_task(chunk):
+                nonlocal completed_count
+                worker_scraper = TorobScraper(captcha_callback=self.captcha_callback)
+                worker_results = []
+                try:
+                    for item in chunk:
+                        res = worker_scraper.scrape_single_product_details(item)
+                        if res:
+                            worker_results.append(res)
                         
-                        self.driver.get(item['url'])
-                        try: self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1, h2")))
-                        except: pass
+                        with count_lock:
+                            completed_count += 1
+                            if progress_callback:
+                                progress_callback(completed_count, total, item['name'])
+                finally:
+                    worker_scraper.close()
+                return worker_results
 
-                        # Image Extraction
-                        image_url = None
-                        for sel in ["[class*='imageGallery_singleImageContainer'] img", "[class*='Showcase_gallery'] img", "div[class*='ProductPage'] picture img"]:
-                            try:
-                                img_el = self.driver.find_element(By.CSS_SELECTOR, sel)
-                                image_url = img_el.get_attribute("src")
-                                if image_url: break
-                            except: continue
+            # Split tasks into chunks
+            num_workers = min(config.SCRAPER_WORKERS, total) if total > 0 else 1
+            chunks = [product_links[i::num_workers] for i in range(num_workers)]
+            
+            print(f"🚀 Starting parallel scrape for {total} products with {num_workers} workers...")
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(worker_task, chunk) for chunk in chunks]
+                for future in futures:
+                    results.extend(future.result())
 
-                        # All Iran filter
-                        try:
-                            badge = self.driver.find_element(By.XPATH, "//*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
-                            self.driver.execute_script("arguments[0].click();", badge)
-                            time.sleep(1)
-                        except: pass
-
-                        # Sellers Extraction
-                        sellers = []
-                        seller_cards = self.driver.find_elements(By.CSS_SELECTOR, ".shop-card.seller-element") or self.driver.find_elements(By.XPATH, "//div[contains(@class, 'shop-card')]")
-                        for card in seller_cards:
-                            try:
-                                if "آگهی" in card.text: continue
-                                name = card.find_element(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']").text.strip()
-                                price_txt = card.find_element(By.CSS_SELECTOR, ".price, [class*='price']").text
-                                price_val = int(re.search(r'(\d+)', self.normalize_digits(price_txt)).group(1))
-                                try: buy_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
-                                except: buy_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
-                                sellers.append({'name': name, 'price': price_val, 'btn': buy_btn})
-                            except: continue
-
-                        if sellers:
-                            # Advanced selection: top 2
-                            sellers.sort(key=lambda x: x['price'])
-                            cheapest = sellers[0]
-                            second_cheapest = sellers[1] if len(sellers) > 1 else None
-                            
-                            final_url = self._follow_redirect(cheapest['btn'])
-                            second_final_url = self._follow_redirect(second_cheapest['btn']) if second_cheapest else None
-
-                            results.append({
-                                'name': item['name'], 
-                                'shop_site_price': item['shop_site_price'],
-                                'price': cheapest['price'], 
-                                'shop_name': cheapest['name'],
-                                'second_price': second_cheapest['price'] if second_cheapest else None,
-                                'second_shop_name': second_cheapest['name'] if second_cheapest else None,
-                                'product_url': final_url, 
-                                'second_product_url': second_final_url,
-                                'image_url': image_url
-                            })
-                        break # Success
-                    except (WebDriverException, Exception) as de:
-                        attempts += 1
-                        err_msg = str(de).lower()
-                        if any(x in err_msg for x in ["connection", "refused", "target", "window"]):
-                            print(f"⚠️ Browser crash on product {idx+1}/{total}. Restarting driver (Attempt {attempts})...")
-                            self.restart_driver(headless=config.HEADLESS)
-                        else:
-                            print(f"❌ Error scraping {item['name']}: {de}")
-                            if attempts >= 3: break
-                        time.sleep(2)
             return results
         except Exception as e:
             print(f"Error extracting shop products: {e}")
-            return []
+            return None
+
+    def scrape_single_product_details(self, item, retries=3):
+        """Scrapes details for a single product. Extracted for parallel use."""
+        attempts = 0
+        while attempts < retries:
+            try:
+                # 🛡 Human-like Jitter
+                time.sleep(random.uniform(0.5, 2.5))
+                
+                self.driver.get(item['url'])
+                
+                if "captcha" in self.driver.current_url or "ربات" in self.driver.page_source:
+                    self._handle_captcha(item['url'])
+                    
+                try: 
+                    self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1, h2")))
+                except: 
+                    pass
+
+                # Image Extraction
+                image_url = None
+                img_selectors = [
+                    "[class*='imageGallery_singleImageContainer'] img", 
+                    "[class*='Showcase_gallery'] img", 
+                    "div[class*='ProductPage'] picture img"
+                ]
+                for sel in img_selectors:
+                    try:
+                        img_el = self.driver.find_element(By.CSS_SELECTOR, sel)
+                        image_url = img_el.get_attribute("src")
+                        if image_url: break
+                    except: continue
+
+                # All Iran filter
+                try:
+                    badge = self.driver.find_element(By.XPATH, "//*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
+                    self.driver.execute_script("arguments[0].click();", badge)
+                    time.sleep(1)
+                except: pass
+
+                # --- Seller Extraction with "Show More" handling ---
+                def extract_sellers_data():
+                    found_sellers = []
+                    local_shop_name = None
+                    
+                    cards_list = self.driver.find_elements(By.CSS_SELECTOR, ".shop-card.seller-element") or \
+                                 self.driver.find_elements(By.XPATH, "//div[contains(@class, 'shop-card')]")
+                    
+                    for card in cards_list:
+                        try:
+                            if "آگهی" in card.text: continue
+                            s_name = card.find_element(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']").text.strip()
+                            
+                            # Extract shop-specific product name if this is our shop
+                            if s_name == config.MY_SHOP_NAME:
+                                try:
+                                    p_name_el = card.find_element(By.CSS_SELECTOR, ".product-name, [class*='product-name']")
+                                    local_shop_name = p_name_el.text.strip()
+                                except: pass
+
+                            p_txt = card.find_element(By.CSS_SELECTOR, ".price, [class*='price']").text
+                            p_val = int(re.search(r'(\d+)', self.normalize_digits(p_txt)).group(1))
+                            try: 
+                                b_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
+                            except: 
+                                b_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
+                            found_sellers.append({'name': s_name, 'price': p_val, 'btn': b_btn})
+                        except: continue
+                    return found_sellers, local_shop_name
+
+                # Initial extraction
+                sellers, shop_product_name = extract_sellers_data()
+
+                # If shop name not found or we need to ensure we see everyone, click "Show More"
+                try:
+                    # Scroll to bottom to trigger button visibility
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    
+                    show_more = self.driver.find_elements(By.CSS_SELECTOR, ".show-more-btn, [class*='show-more-btn']")
+                    if show_more:
+                        print(f"🔗 Clicking 'Show More Sellers' to find {config.MY_SHOP_NAME}...")
+                        self.driver.execute_script("arguments[0].click();", show_more[0])
+                        time.sleep(2)
+                        # Re-extract
+                        sellers, shop_product_name = extract_sellers_data()
+                except Exception as e:
+                    print(f"⚠️ Note: Could not expand sellers list: {e}")
+
+                if sellers:
+                    sellers.sort(key=lambda x: x['price'])
+                    cheapest = sellers[0]
+                    second_cheapest = sellers[1] if len(sellers) > 1 else None
+                    
+                    # Optimized: Skip the highly slow follow_redirect to significantly speed up processing
+                    # final_url = self._follow_redirect(cheapest['btn'])
+                    # second_final_url = self._follow_redirect(second_cheapest['btn']) if second_cheapest else None
+                    final_url = cheapest['btn'].get_attribute("href") if cheapest.get('btn') else ""
+                    second_final_url = second_cheapest['btn'].get_attribute("href") if second_cheapest and second_cheapest.get('btn') else ""
+
+                    return {
+                        'name': item['name'], 
+                        'shop_product_name': shop_product_name,
+                        'shop_site_price': item['shop_site_price'],
+                        'price': cheapest['price'], 
+                        'shop_name': cheapest['name'],
+                        'second_price': second_cheapest['price'] if second_cheapest else None,
+                        'second_shop_name': second_cheapest['name'] if second_cheapest else None,
+                        'product_url': final_url, 
+                        'second_product_url': second_final_url,
+                        'image_url': image_url
+                    }
+                return None
+            except (WebDriverException, Exception) as de:
+                attempts += 1
+                err_msg = str(de).lower()
+                if any(x in err_msg for x in ["connection", "refused", "target", "window"]):
+                    self.restart_driver(headless=config.HEADLESS)
+                if attempts >= retries:
+                    return None
+                time.sleep(2)
+        return None

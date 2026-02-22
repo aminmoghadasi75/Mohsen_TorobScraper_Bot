@@ -40,13 +40,14 @@ class PriceUpdateBot:
         config.PRICE_DIFF_GOAL = self.settings.get('price_diff', 100000)
         
         # Increase timeout and pool size
-        request = HTTPXRequest(connection_pool_size=20, connect_timeout=30, read_timeout=30)
+        request = HTTPXRequest(connection_pool_size=20, connect_timeout=60, read_timeout=60)
         self.app = ApplicationBuilder().token(token).request(request).build()
         self._setup_handlers()
         
         self.pending_updates = {}
         self.gerishmall_api = GerishmallAPI()
         self.manual_scraping_lock = False
+        self.lock_owner = None
         
         # Performance Cache
         self._sheet_cache = None
@@ -55,7 +56,10 @@ class PriceUpdateBot:
         
         # Task Queue for Price Updates
         self.update_queue = asyncio.Queue()
-        self.app.job_queue.run_once(self.start_worker_task, 0)
+        asyncio.create_task(self.update_worker())
+        
+        # Tracking for small pinned status headers
+        self._pinned_status_messages = {} # chat_id -> message_id
         
         # Start Background Scheduler for Scraper
         self.app.job_queue.run_repeating(self.background_scraper_task, interval=60) # Checks every minute if it's time
@@ -63,12 +67,24 @@ class PriceUpdateBot:
     def _load_settings(self):
         if os.path.exists(config.SETTINGS_FILE):
             with open(config.SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                settings = json.load(f)
+            
+            # Migration to minutes for all time-based settings
+            if settings.get('scan_interval', 0) >= 10: # Likely stored in seconds
+                settings['scan_interval'] = max(1, settings['scan_interval'] // 60)
+            
+            # If auto_sync_interval is large, it's in seconds
+            if settings.get('auto_sync_interval', 0) >= 60:
+                settings['auto_sync_interval'] = settings['auto_sync_interval'] // 60
+                
+            return settings
+            
         return {
             "admins": {str(config.SUPER_ADMIN_ID): "محمدامین"},
             "notifications": True,
-            "scan_interval": 60,
-            "price_diff": 100000
+            "scan_interval": 1, # Default 1 minute
+            "price_diff": 100000,
+            "auto_sync_interval": 60 # Default 60 minutes
         }
 
     def _save_settings(self):
@@ -130,6 +146,7 @@ class PriceUpdateBot:
                 # 1. Update Sheet (Async-safe)
                 # Fetch old price from the task data (passed through the queue)
                 old_price = task.get('old_p', 0)
+                shop_product_name = task.get('shop_product_name')
 
                 await loop.run_in_executor(
                     executor, self.sheets.update_cell, row_index, config.COL_SITE_PRICE, new_price
@@ -158,7 +175,7 @@ class PriceUpdateBot:
                         await asyncio.sleep(retry_delay)
                     
                     site_success = await loop.run_in_executor(
-                        executor, self.gerishmall_api.update_price, product_name, new_price
+                        executor, self.gerishmall_api.update_price, shop_product_name or product_name, new_price
                     )
                     
                     if site_success: break
@@ -171,7 +188,7 @@ class PriceUpdateBot:
                     from scrapers.my_site_scraper import MySiteScraper
                     site_scraper = MySiteScraper()
                     site_success = await loop.run_in_executor(
-                        executor, site_scraper.update_price, product_name, new_price
+                        executor, site_scraper.update_price, shop_product_name or product_name, new_price
                     )
 
                 # 3. Finalize UI Update
@@ -281,8 +298,8 @@ class PriceUpdateBot:
         settings_text = (
             f"⚙️ **تنظیمات سیستم**\n\n"
             f"💰 فاصله رقابتی: `{self.settings['price_diff']:,}` تومان\n"
-            f"⏱ مانیتورینگ فروشگاه : هر `{self.settings['scan_interval']}` ثانیه\n"
-            f"📥 آپدیت ترب: هر `{self.settings.get('auto_sync_interval', 3600) // 60}` دقیقه\n"
+            f"⏱ مانیتورینگ فروشگاه : هر `{self.settings['scan_interval']}` دقیقه\n"
+            f"📥 آپدیت ترب: هر `{self.settings.get('auto_sync_interval', 60)}` دقیقه\n"
             f"🔔 وضعیت اعلان: `{notif_status}`\n\n"
             f"یکی از موارد زیر را برای تغییر انتخاب کنید:"
         )
@@ -319,6 +336,13 @@ class PriceUpdateBot:
         """Clears all locks and forces a re-scan of the market with progress reporting."""
         if not self.is_admin(update.effective_user.id): return
         
+        if getattr(self, 'manual_scraping_lock', False):
+            await update.message.reply_text("⛔️ یک عملیات سنگین در حال اجراست. لطفا چند لحظه صبر کنید.")
+            return
+
+        self.manual_scraping_lock = True
+        self.lock_owner = "force_refresh"
+        
         msg = await update.message.reply_text("⏳ در حال پاکسازی هشدارهای قبلی و شروع مانیتورینگ جدید...")
         start_t = time.time()
         
@@ -345,7 +369,7 @@ class PriceUpdateBot:
             await self._update_progress(msg, "شروع اسکن مجدد", 20, start_t)
             results = await self.run_monitoring_scan(msg, start_t)
             
-            await self._update_progress(msg, "کامل شد", 100, start_t)
+            await self._update_progress(msg, "بررسی مجدد قیمت‌ها", 100, start_t) # Final call with the real name
             await msg.edit_text(
                 f"✅ **عملیات مانیتورینگ مجدد با موفقیت تمام شد.**\n\n"
                 f"📊 تعداد کالا پردازش شده: `{results['total']}`\n"
@@ -355,7 +379,11 @@ class PriceUpdateBot:
             )
         except Exception as e:
             logging.error(f"Force Refresh Error: {e}")
+            await self._update_progress(msg, "خطا در عملیات", 0, start_t, error=True)
             await msg.edit_text(f"❌ خطا در مانیتورینگ مجدد: {e}")
+        finally:
+            self.manual_scraping_lock = False
+            self.lock_owner = None
 
 
     async def _get_data(self, force_refresh=False):
@@ -367,32 +395,6 @@ class PriceUpdateBot:
             self._cache_time = now
         return self._sheet_cache
 
-    async def _update_progress(self, message, step_name, percent, start_time):
-        """Premium UI: Updates a single message with progress bar and ETA."""
-        bar_length = 10
-        filled = int(bar_length * percent / 100)
-        bar = "🟩" * filled + "⬜" * (bar_length - filled)
-        
-        # Calculate ETA
-        elapsed = time.time() - start_time
-        if percent > 0:
-            total_est = elapsed / (percent / 100)
-            eta = int(total_est - elapsed)
-            eta_str = f"{eta} ثانیه" if eta > 0 else "لحظاتی دیگر"
-        else:
-            eta_str = "در حال محاسبه..."
-
-        text = (
-            f"🔄 **در حال عملیات: {step_name}**\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📊 پیشرفت: `{percent}%` [{bar}]\n"
-            f"⏳ زمان باقی‌مانده: `{eta_str}`\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"⚡️تا پایان فرایند منتظر بمانید."
-        )
-        try:
-            await message.edit_text(text, parse_mode='Markdown')
-        except Exception: pass
 
     async def menu_market_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Generates a real-time summary using caching for instant response."""
@@ -410,9 +412,9 @@ class PriceUpdateBot:
             perfect_price = 0
             
             for rec in records:
-                t_price = int(rec.get(config.COL_TOROB_PRICE, 0))
-                s_price = int(rec.get(config.COL_SITE_PRICE, 0))
-                p_cost = int(rec.get(config.COL_PURCHASE_COST, 0))
+                t_price = int(rec.get(config.COL_TOROB_PRICE) or 0)
+                s_price = int(rec.get(config.COL_SITE_PRICE) or 0)
+                p_cost = int(rec.get(config.COL_PURCHASE_COST) or 0)
                 
                 if t_price <= 0: continue
                 ideal = max(t_price - config.PRICE_DIFF_GOAL, p_cost)
@@ -443,34 +445,51 @@ class PriceUpdateBot:
         """Manually triggers the products sync with dynamic UI."""
         if not self.is_admin(update.effective_user.id): return
         if self.manual_scraping_lock:
-            await update.message.reply_text("⚠️ سیستم در حال انجام یک عملیات سنگین دیگر است.")
+            owner_text = "خودکار (سیستمی)" if self.lock_owner == "background" else "دستی (توسط ادمین)"
+            await update.message.reply_text(f"⚠️ سیستم در حال انجام یک عملیات سنگین {owner_text} است.\nلطفاً تا پایان آن صبر کنید یا از بخش 'بررسی مجدد قیمت‌ها' قفل را پاکسازی کنید.")
             return
             
         self.manual_scraping_lock = True
+        self.lock_owner = "manual"
         msg = await update.message.reply_text("🚀 فرآیند آپدیت ترب آغاز شد...")
         start_t = time.time()
         
         try:
-            await self._update_progress(msg, "دریافت اطلاعات از ترب", 20, start_t)
+            # We start with a low percentage to show action, but without jumping.
+            # Removed the 20% jump from here.
             
-            # Use our sync logic but pass progress if we can (simplified for now)
+            # Execute scraper with callback
             results = await self.run_sync_logic(msg, start_t)
             
-            await self._update_progress(msg, "کامل شد", 100, start_t)
+            if results is None:
+                await self._update_progress(msg, "خطا در استخراج", 0, start_t, error=True)
+                await msg.edit_text(
+                    "❌ **خطا در استخراج محصولات از ترب.**\n\n"
+                    "این خطا معمولاً به دلایل زیر رخ می‌دهد:\n"
+                    "۱. شناسایی ربات توسط ترب (کپچا)\n"
+                    "۲. کندی اینترنت یا قطع اتصال به سایت ترب\n\n"
+                    "💡 پیشنهاد: کمی صبر کنید و مجدداً تلاش کنید.",
+                    parse_mode='Markdown'
+                )
+                return
+
+            await self._update_progress(msg, "آپدیت ترب", 100, start_t)
             
             summary = (
                 f"✅ **آپدیت ترب با موفقیت انجام شد.**\n\n"
                 f"🆕 محصولات جدید: `{results['added']}`\n"
                 f"🔄 بروزرسانی شده: `{results['updated']}`\n"
-                f"🗑 حذف شده: `{results['deleted']}`\n\n"
+                f"📂 محصولات ابقا شده (آرشیو): `{results.get('kept', 0)}`\n\n"
                 f"⏱ کل زمان: `{int(time.time()-start_t)} ثانیه`"
             )
             await msg.edit_text(summary, parse_mode='Markdown')
             await self._get_data(force_refresh=True) # Refresh cache after update
         except Exception as e:
+            await self._update_progress(msg, "خطا در عملیات", 0, start_t, error=True)
             await msg.edit_text(f"❌ خطا: {e}")
         finally:
             self.manual_scraping_lock = False
+            self.lock_owner = None
 
     async def run_sync_logic(self, progress_msg=None, start_t=None):
         """Optimized sync logic with real-time granular progress tracking."""
@@ -480,11 +499,24 @@ class PriceUpdateBot:
         
         def scraper_progress_callback(current, total, name):
             """Sync callback from scraper thread to async Telegram UI."""
-            # We must use run_coroutine_threadsafe to talk to the bot from a thread
             percent = int((current / total) * 100)
             status_text = f"محصول {current} از {total}: {name[:20]}..."
             asyncio.run_coroutine_threadsafe(
                 self._update_progress(progress_msg, status_text, percent, start_t),
+                loop
+            )
+
+        def scraper_captcha_callback():
+            """Notify admin that a CAPTCHA needs manual solution."""
+            if not progress_msg: return
+            alert_text = (
+                "🧩 **هشدار کپچا (CAPTCHA)**\n\n"
+                "سایت ترب فعالیت ربات را شناسایی کرده است.\n"
+                "یک پنجره مرورگر باز شده است. لطفاً کپچا را به صورت دستی حل کنید.\n"
+                "پس از حل کپچا، پردازش به صورت خودکار ادامه خواهد یافت."
+            )
+            asyncio.run_coroutine_threadsafe(
+                self.app.bot.send_message(chat_id=progress_msg.chat_id, text=alert_text, parse_mode='Markdown'),
                 loop
             )
 
@@ -497,111 +529,138 @@ class PriceUpdateBot:
                 executor, 
                 scraper.get_shop_products, 
                 SHOP_URL, 
-                scraper_progress_callback if progress_msg else None
+                scraper_progress_callback if progress_msg else None,
+                scraper_captcha_callback if progress_msg else None
             )
             
             if progress_msg:
                 asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, "بررسی دیتای شیت...", 90, start_t), loop)
+            
+            if shop_products is None:
+                if progress_msg:
+                    await self._update_progress(progress_msg, "خطا در استخراج محصولات (باگ یا کپچا)", 0, start_t, error=True)
+                return None
+                
             records = await loop.run_in_executor(executor, self.sheets.get_all_records)
             sheet_map = {r.get(config.COL_PRODUCT_NAME): i for i, r in enumerate(records)}
-            
             scraped_map = {p['name']: p for p in shop_products}
-            added = updated = deleted = 0
             
-            # Prepare Batch Update Data
+            added = updated = kept = 0
             all_rows = []
             headers = config.SHEET_COLUMNS
-            
-            # 1. Handle Updates & Persistence
             red_rows = []
-            for name, p in scraped_map.items():
-                is_my_shop = config.MY_SHOP_NAME in str(p.get('shop_name', ''))
-                # Case: Gerishmall is the only seller
-                is_sole_seller = is_my_shop and (not p.get('second_price') or int(p.get('second_price')) == 0)
-                
-                target_url = p.get('second_product_url') if is_my_shop and p.get('second_product_url') else p.get('product_url')
 
-                if name in sheet_map:
-                    row_idx = sheet_map[name]
-                    current_record = records[row_idx]
+            # 1. Update Existing Products and Keep those not on Torob
+            processed_scraped_names = set()
+            
+            for i, record in enumerate(records):
+                name = record.get(config.COL_PRODUCT_NAME)
+                if not name: continue
+                
+                if name in scraped_map:
+                    p = scraped_map[name]
+                    processed_scraped_names.add(name)
+                    
+                    is_my_shop = config.MY_SHOP_NAME in str(p.get('shop_name', ''))
+                    is_sole_seller = is_my_shop and (not p.get('second_price') or int(p.get('second_price')) == 0)
+                    target_url = p.get('second_product_url') if is_my_shop and p.get('second_product_url') else p.get('product_url')
+
                     row_data = [
                         name,
-                        current_record.get(config.COL_PURCHASE_COST, ""),
+                        p.get('shop_product_name', ""),
+                        record.get(config.COL_PURCHASE_COST, ""), # PRESERVE MANUAL VALUE
                         p.get('shop_site_price', ""),
                         p['price'],
                         p['shop_name'],
                         self.sheets.format_hyperlink(target_url, "لینک محصول"),
                         self.sheets.format_hyperlink(p['image_url'], "عکس محصول"),
-                        current_record.get(config.COL_TELEGRAM_MSG_ID, ""),
-                        current_record.get(config.COL_ADMIN_NAME, ""),
+                        record.get(config.COL_TELEGRAM_MSG_ID, ""),
+                        record.get(config.COL_ADMIN_NAME, ""),
                         p.get('second_price', ""),
                         p.get('second_shop_name', "")
                     ]
                     updated += 1
+                    if is_sole_seller:
+                        red_rows.append(len(all_rows) + 1)
                 else:
+                    # Not found on Torob anymore, but KEEP in sheet to preserve manual data
+                    row_data = [record.get(h, "") for h in headers]
+                    # Optionally mark it
+                    # row_data[headers.index(config.COL_SHOP_NAME)] = "⚠️ ناموجود در ترب"
+                    kept += 1
+                
+                all_rows.append(row_data)
+
+            # 2. Add New Products found on Torob
+            for name, p in scraped_map.items():
+                if name not in processed_scraped_names:
+                    is_my_shop = config.MY_SHOP_NAME in str(p.get('shop_name', ''))
+                    is_sole_seller = is_my_shop and (not p.get('second_price') or int(p.get('second_price')) == 0)
+                    target_url = p.get('second_product_url') if is_my_shop and p.get('second_product_url') else p.get('product_url')
+
                     row_data = [
-                        name, "", p.get('shop_site_price', ""), p['price'], p['shop_name'],
+                        name, p.get('shop_product_name', ""), "", p.get('shop_site_price', ""), p['price'], p['shop_name'],
                         self.sheets.format_hyperlink(target_url, "لینک محصول"),
                         self.sheets.format_hyperlink(p['image_url'], "عکس محصول"), "", "",
                         p.get('second_price', ""),
                         p.get('second_shop_name', "")
                     ]
                     added += 1
-                
-                all_rows.append(row_data)
-                if is_sole_seller:
-                    red_rows.append(len(all_rows) + 1) # +1 because data starts at A2
-            if progress_msg: await self._update_progress(progress_msg, "اعمال تغییرات روی گوگل‌شیت", 85, start_t)
+                    all_rows.append(row_data)
+                    if is_sole_seller:
+                        red_rows.append(len(all_rows) + 1) # Already added to list, so adjust index
+
+            if progress_msg: await self._update_progress(progress_msg, "اعمال تغییرات روی گوگل‌شیت", 95, start_t)
 
             # BATCH UPDATE: Overwrite the sheet data starting from row 2
-            # This is MUCH faster than updating one-by-one
             def batch_overwrite():
                 import gspread
-                # First, we need to handle products that were DELETED
-                # The easiest way is to clear the content first or just rewrite everything and let the user know
-                # Let's perform a simple overwrite of the effective range
-                end_col_letter = gspread.utils.rowcol_to_a1(1, len(headers))[:1]
-                data_range = f"A2:{end_col_letter}{len(all_rows) + 1}"
-                
-                # Clear existing if needed, then update
-                self.sheets.sheet.clear()
-                self.sheets.sheet.update("A1", [headers])
                 if all_rows:
+                    # 1. Update row 2 onwards FIRST (to avoid font reset)
+                    end_col_letter = gspread.utils.rowcol_to_a1(1, len(headers))[:1]
                     self.sheets.sheet.update("A2", all_rows, value_input_option="USER_ENTERED")
                     
-                    # 🎨 COLOR MANAGEMENT: Reset all to white, then apply red
-                    # Get max column letter
-                    last_col = gspread.utils.rowcol_to_a1(1, len(headers))[:1]
-                    total_range = f"A2:{last_col}{len(all_rows) + 1}"
+                    # 2. Apply premium styling (Font, Green Headers, Number formatting) 
+                    # CRITICAL: Must be AFTER update to prevent default font override
+                    self.sheets.apply_style()
                     
-                    # Reset formatting
-                    white_fmt = {"backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "textFormat": {"bold": False}}
-                    self.sheets.sheet.format(total_range, white_fmt)
-                    
-                    # Apply Red to Sole Sellers
+                    # 3. 🎨 COLOR MANAGEMENT (Exclusive Products = Red)
                     if red_rows:
-                        red_fmt = {"backgroundColor": {"red": 1.0, "green": 0.8, "blue": 0.8}, "textFormat": {"bold": True}}
-                        # Apply red to each identified row
+                        # Reset all data rows to white/default if necessary (apply_style should handle defaults)
+                        red_fmt = {"backgroundColor": {"red": 1.0, "green": 0.8, "blue": 0.8}, "textFormat": {"bold": True, "fontFamily": "Vazirmatn"}}
+                        ranges_to_color = []
                         for r_idx in red_rows:
-                            row_range = f"A{r_idx}:{last_col}{r_idx}"
-                            self.sheets.sheet.format(row_range, red_fmt)
+                            abs_row = r_idx + 1 # +1 because red_rows was populated based on all_rows (0-indexed list) + 1
+                            ranges_to_color.append({
+                                "range": f"A{abs_row}:{end_col_letter}{abs_row}",
+                                "format": red_fmt
+                            })
+                        
+                        # Apply red coloring to specific rows
+                        if ranges_to_color:
+                            self.sheets.sheet.batch_format(ranges_to_color)
             
             await loop.run_in_executor(executor, batch_overwrite)
-            return {"added": added, "updated": updated, "deleted": deleted}
+            await self._get_data(force_refresh=True) # Important: Refresh cache with new styled data
+            return {"added": added, "updated": updated, "deleted": 0, "kept": kept}
         finally:
             scraper.close()
 
     async def background_scraper_task(self, context: ContextTypes.DEFAULT_TYPE):
         """Automatic periodic sync."""
         last_sync = self.settings.get('last_auto_sync', 0)
-        auto_interval = self.settings.get('auto_sync_interval', 3600) # Default 1 hour
+        auto_interval = self.settings.get('auto_sync_interval', 60) # Default 1 hour (minutes)
         
-        if auto_interval > 0 and (time.time() - last_sync) >= auto_interval:
-            if self.manual_scraping_lock: return
+        if auto_interval > 0 and (time.time() - last_sync) >= (auto_interval * 60):
+            if self.manual_scraping_lock:
+                logging.warning("Background Sync skipped: another heavy operation is running.")
+                return
             
             logging.info("Starting Automatic Torob Sync...")
             self.manual_scraping_lock = True
+            self.lock_owner = "background"
             try:
+                logging.info("Executing run_sync_logic in background...")
                 await self.run_sync_logic()
                 self.settings['last_auto_sync'] = time.time()
                 self._save_settings()
@@ -610,6 +669,7 @@ class PriceUpdateBot:
                 logging.error(f"Auto Sync Failed: {e}")
             finally:
                 self.manual_scraping_lock = False
+                self.lock_owner = None
         
     async def run_monitoring_scan(self, progress_msg=None, start_t=None):
         """High-performance monitoring scan with batch sheet locking and progress reporting."""
@@ -633,12 +693,13 @@ class PriceUpdateBot:
                 status = f"پایش محصول {idx+1} از {total}: {product_name[:15]}..."
                 asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, status, percent, start_t), loop)
 
-            purchase_cost = int(record.get(config.COL_PURCHASE_COST, 0))
-            site_price = int(record.get(config.COL_SITE_PRICE, 0))
-            torob_price = int(record.get(config.COL_TOROB_PRICE, 0))
+            purchase_cost = int(record.get(config.COL_PURCHASE_COST) or 0)
+            site_price = int(record.get(config.COL_SITE_PRICE) or 0)
+            torob_price = int(record.get(config.COL_TOROB_PRICE) or 0)
             shop_name = record.get(config.COL_SHOP_NAME, "")
-            second_price = int(record.get(config.COL_SECOND_TOROB_PRICE, 0))
+            second_price = int(record.get(config.COL_SECOND_TOROB_PRICE) or 0)
             existing_msg_id = record.get(config.COL_TELEGRAM_MSG_ID)
+            shop_product_name = record.get(config.COL_SHOP_PRODUCT_NAME)
 
             if not product_name or not torob_price or torob_price == 0:
                 continue
@@ -649,8 +710,8 @@ class PriceUpdateBot:
             if is_my_shop:
                 if not second_price or int(second_price) == 0:
                     # Case A: ONLY Gerishmall is selling
-                    # No alert, just highlight in sheet with red
-                    await loop.run_in_executor(executor, self.sheets.color_row, current_row, {'red': 1.0, 'green': 0.8, 'blue': 0.8})
+                    # Coloring is already handled in batch during run_sync_logic to save API quota.
+                    # Just clear any old alerts.
                     if existing_msg_id:
                         await loop.run_in_executor(executor, self.sheets.update_cell_by_index, current_row, msg_col_idx, "")
                     continue
@@ -685,6 +746,7 @@ class PriceUpdateBot:
 
             alert_data = {
                 'name': product_name,
+                'shop_product_name': shop_product_name,
                 'purchase_cost': purchase_cost,
                 'torob_price': benchmark_price, # Benchmark instead of our own price
                 'site_price': site_price,
@@ -712,8 +774,73 @@ class PriceUpdateBot:
         
         return {"total": total, "alerts": alerts_count}
 
-    async def _update_progress(self, message, step_name, percent, start_time):
-        """Premium UI: Updates a single message with progress bar and ETA."""
+    async def _update_pinned_header(self, chat_id, step_name, percent, finished=False, error=False):
+        """Manages a separate small pinned status message for professional look."""
+        try:
+            # Emoji Selection Logic
+            def get_emoji(name):
+                name = name.lower()
+                if "ترب" in name: return "📥"
+                if any(x in name for x in ["بررسی", "مانیتور", "اسکن", "قیمت"]): return "🔍"
+                if any(x in name for x in ["پاکسازی", "رفرش", "قفل"]): return "♻️"
+                return "⚙️"
+
+            emoji = "❌" if error else ("✅" if finished else get_emoji(step_name))
+            
+            if finished:
+                # The user requested: فرآیند --- با موفقیت انجام شد. or specific for task
+                # We try to use a more natural name if possible
+                task_display = "بروزرسانی" if "ترب" in step_name else "مانیتورینگ" if "بررسی" in step_name else step_name
+                text = f"{emoji} فرآیند **{task_display}** با موفقیت انجام شد."
+            elif error:
+                text = f"{emoji} خطا در فرآیند **{step_name}**!"
+            else:
+                text = f"پیشرفت: {percent}% {emoji}"
+
+            pinned_msg_id = self._pinned_status_messages.get(chat_id)
+
+            if not pinned_msg_id:
+                # Create and pin
+                msg = await self.app.bot.send_message(chat_id, text, parse_mode='Markdown')
+                self._pinned_status_messages[chat_id] = msg.message_id
+                try:
+                    await msg.pin(disable_notification=True)
+                except: pass
+            else:
+                # Update existing
+                try:
+                    await self.app.bot.edit_message_text(chat_id=chat_id, message_id=pinned_msg_id, text=text, parse_mode='Markdown')
+                except Exception:
+                    # Message might have been deleted manually
+                    msg = await self.app.bot.send_message(chat_id, text, parse_mode='Markdown')
+                    self._pinned_status_messages[chat_id] = msg.message_id
+                    try: await msg.pin(disable_notification=True)
+                    except: pass
+
+            if finished or error:
+                # Schedule unpin and delete after 10 seconds
+                async def cleanup_pinned(context):
+                    msg_id = self._pinned_status_messages.get(chat_id)
+                    if msg_id:
+                        try:
+                            await self.app.bot.unpin_chat_message(chat_id, msg_id)
+                            await self.app.bot.delete_message(chat_id, msg_id)
+                        except: pass
+                        self._pinned_status_messages.pop(chat_id, None)
+
+                self.app.job_queue.run_once(cleanup_pinned, 10)
+        except Exception as e:
+            logging.error(f"Pinned header error: {e}")
+
+    async def _update_progress(self, message, step_name, percent, start_time, error=False):
+        """Premium UI: Updates a single message with progress bar. Also manages pinned header."""
+        chat_id = message.chat.id
+        finished = percent >= 100
+        
+        # 1. Update the small pinned header (Professional Request)
+        await self._update_pinned_header(chat_id, step_name, percent, finished, error)
+
+        # 2. Update the main detailed message
         bar_length = 10
         filled = int(bar_length * percent / 100)
         bar = "🟩" * filled + "⬜" * (bar_length - filled)
@@ -731,12 +858,13 @@ class PriceUpdateBot:
             f"🔄 **در حال عملیات: {step_name}**\n"
             f"━━━━━━━━━━━━━━\n"
             f"📊 پیشرفت: `{percent}%` [{bar}]\n"
-            f"⏳ زمان باقی‌مانده: `{eta_str}`\n"
+            f"⏳ زمان تقریبی باقی‌مانده: `{eta_str}`\n"
             f"━━━━━━━━━━━━━━\n"
-            f"⚡️تا پایان فرایند منتظر بمانید. "
+            f"⚡️تا پایان فرایند منتظر بمانید.\n"
         )
         try:
-            await message.edit_text(text, parse_mode='Markdown')
+            # Don't pin the main message anymore (User asked for small header only)
+            await message.edit_text(text, parse_mode='Markdown', disable_web_page_preview=True)
         except Exception: pass
 
     async def menu_profit_margin_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -747,8 +875,8 @@ class PriceUpdateBot:
         margin_list = []
         for rec in records:
             name = rec.get(config.COL_PRODUCT_NAME)
-            s_price = rec.get(config.COL_SITE_PRICE, 0)
-            p_cost = rec.get(config.COL_PURCHASE_COST, 0)
+            s_price = int(rec.get(config.COL_SITE_PRICE) or 0)
+            p_cost = int(rec.get(config.COL_PURCHASE_COST) or 0)
             
             if s_price > 0 and p_cost > 0:
                 profit = s_price - p_cost
@@ -823,8 +951,8 @@ class PriceUpdateBot:
         records = await self._get_data() # Uses cache
         critical_list = []
         for rec in records:
-            s_price = int(rec.get(config.COL_SITE_PRICE, 0))
-            p_cost = int(rec.get(config.COL_PURCHASE_COST, 0))
+            s_price = int(rec.get(config.COL_SITE_PRICE) or 0)
+            p_cost = int(rec.get(config.COL_PURCHASE_COST) or 0)
             
             if s_price > 0:
                 margin = (s_price - p_cost) / s_price
@@ -892,13 +1020,16 @@ class PriceUpdateBot:
         """
         import html
         row_index = product_data['row_index']
-        safe_name = html.escape(product_data['name'])
+        name_to_display = product_data.get('shop_product_name')
+        if not name_to_display or not str(name_to_display).strip():
+            name_to_display = product_data.get('name')
+        safe_name = html.escape(str(name_to_display))
         
         text = (
             f"🏷 <b>{safe_name}</b>\n"
             f"━━━━━━━━━━━━━━\n"
             f"💰 <b>قیمت خرید:</b> <code>{product_data['purchase_cost']:,}</code> تومان\n"
-            f"💻 <b>قیمت سایت:</b> <code>{product_data['site_price']:,}</code> تومان\n"
+            f"💻 <b>قیمت گریش مال:</b> <code>{product_data['site_price']:,}</code> تومان\n"
             f"🔍 <b>قیمت ترب:</b> <code>{product_data['torob_price']:,}</code> تومان\n\n"
             f"✨ <b>قیمت پیشنهادی:</b> 🟢 <code>{product_data['suggestion']:,}</code> تومان\n"
             f"📊 <b>مقدار تغییر:</b> <code>{product_data['diff_display']}</code>\n"
@@ -967,6 +1098,26 @@ class PriceUpdateBot:
             except Exception as e:
                 logging.debug(f"Could not edit message for admin {chat_id}: {e}")
 
+    async def _clear_awaiting_states(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Standardizes clearing of awaiting states and deletes previous prompt messages."""
+        keys_to_clear = [
+            'awaiting_goal', 'awaiting_interval', 'awaiting_auto_sync', 
+            'awaiting_admin_id', 'awaiting_admin_name', 'awaiting_price'
+        ]
+        for key in keys_to_clear:
+            context.user_data.pop(key, None)
+        
+        # Delete previous prompt if it exists
+        if 'last_prompt_id' in context.user_data:
+            try:
+                await self.app.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['last_prompt_id']
+                )
+            except Exception:
+                pass
+            context.user_data.pop('last_prompt_id', None)
+
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = update.effective_user.id
@@ -976,6 +1127,10 @@ class PriceUpdateBot:
         logging.info(f"Callback received: {query.data} from {admin_name} ({user_id})")
         
         if not self.is_admin(user_id): return
+        
+        # Always clear states and previous prompts on any callback button click
+        # This prevents state conflicts if user clicks a new setting while another is active
+        await self._clear_awaiting_states(update, context)
 
         # Advanced Setting Handlers
         if query.data == "toggle_notif":
@@ -986,24 +1141,28 @@ class PriceUpdateBot:
 
         if query.data == "change_goal":
             context.user_data['awaiting_goal'] = True
-            await query.message.reply_text("🔢 لطفاً مقدار جدید فاصله قیمتی  را به تومان وارد کنید (مثلاً ۱۰۰۰۰۰):")
+            msg = await query.message.reply_text("🔢 لطفاً مقدار جدید فاصله قیمتی  را به تومان وارد کنید (مثلاً ۱۰۰۰۰۰):")
+            context.user_data['last_prompt_id'] = msg.message_id
             return
 
         if query.data == "change_interval":
             context.user_data['awaiting_interval'] = True
-            await query.message.reply_text("⏱ لطفاً زمان جدید بررسی شیت و مانیتورینگ فروشگاه  را به ثانیه وارد کنید (مثلاً ۶۰):")
+            msg = await query.message.reply_text("⏱ لطفاً زمان جدید بررسی شیت و مانیتورینگ فروشگاه  را به **دقیقه** وارد کنید (مثلاً ۱):")
+            context.user_data['last_prompt_id'] = msg.message_id
             return
 
         if query.data == "change_auto_sync":
             context.user_data['awaiting_auto_sync'] = True
-            await query.message.reply_text("📥 لطفاً بازه زمانی آپدیت خودکار از ترب را به **دقیقه** وارد کنید (مثلاً ۶۰ برای ۱ ساعت، ۰ برای غیرفعال):")
+            msg = await query.message.reply_text("📥 لطفاً بازه زمانی آپدیت خودکار از ترب را به **دقیقه** وارد کنید (مثلاً ۶۰ برای ۱ ساعت، ۰ برای غیرفعال):")
+            context.user_data['last_prompt_id'] = msg.message_id
             return
 
         # Admin Management Handlers (Super Admin Only)
         if query.data == "add_admin":
             if not self.is_super_admin(user_id): return
             context.user_data['awaiting_admin_id'] = True
-            await query.message.reply_text("🆔 لطفاً ID عددی تلگرام ادمین جدید را وارد کنید:")
+            msg = await query.message.reply_text("🆔 لطفاً ID عددی تلگرام ادمین جدید را وارد کنید:")
+            context.user_data['last_prompt_id'] = msg.message_id
             return
 
         if query.data == "remove_admin":
@@ -1047,10 +1206,12 @@ class PriceUpdateBot:
             update_data = self.pending_updates.get(key)
             if update_data:
                 # Add to Queue instead of processing immediately
+                logging.info(f"➕ Adding {update_data['name']} to update queue (Suggestion: {update_data['suggestion']})")
                 await self.update_queue.put({
                     'row_index': row_index,
                     'new_price': update_data['suggestion'],
                     'product_name': update_data['name'],
+                    'shop_product_name': update_data.get('shop_product_name'),
                     'admin_name': admin_name,
                     'user_id': user_id,
                     'old_p': update_data['site_price']
@@ -1081,11 +1242,12 @@ class PriceUpdateBot:
 
         elif action == "custom":
             context.user_data['awaiting_price'] = row_index
-            await self.app.bot.send_message(
+            msg = await self.app.bot.send_message(
                 chat_id=user_id,
                 text=f"🔢 لطفاً قیمت جدید برای <b>{html.escape(self.pending_updates[key]['name'])}</b> را وارد کنید:",
                 parse_mode='HTML'
             )
+            context.user_data['last_prompt_id'] = msg.message_id
 
         elif action == "custom_confirm":
             await self._process_custom_confirmation(update, context, row_index, True)
@@ -1095,10 +1257,11 @@ class PriceUpdateBot:
 
         elif action == "custom_edit":
             context.user_data['awaiting_price'] = row_index
-            await query.message.reply_text(
+            msg = await query.message.reply_text(
                 f"✍️ مجدداً قیمت جدید برای **{self.pending_updates[key]['name']}** را وارد کنید:",
                 parse_mode='Markdown'
             )
+            context.user_data['last_prompt_id'] = msg.message_id
 
     async def _process_custom_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE, row_index, confirmed):
         user_id = update.effective_user.id
@@ -1135,10 +1298,12 @@ class PriceUpdateBot:
         # If confirmed
         if suggested_price:
             # Add to Queue for processing
+            logging.info(f"➕ Adding {name} to update queue (Custom: {suggested_price})")
             await self.update_queue.put({
                 'row_index': row_index,
                 'new_price': suggested_price,
                 'product_name': name,
+                'shop_product_name': update_data.get('shop_product_name') if update_data else None,
                 'admin_name': admin_name,
                 'user_id': user_id,
                 'old_p': update_data['site_price'] if update_data else 0
@@ -1159,8 +1324,8 @@ class PriceUpdateBot:
             records = await loop.run_in_executor(executor, self.sheets.get_all_records)
             if len(records) >= row_index - 1:
                 rec = records[row_index - 2]
-                t_price = int(rec.get(config.COL_TOROB_PRICE, 0))
-                p_cost = int(rec.get(config.COL_PURCHASE_COST, 0))
+                t_price = int(rec.get(config.COL_TOROB_PRICE) or 0)
+                p_cost = int(rec.get(config.COL_PURCHASE_COST) or 0)
                 
                 # Recover msg_map from COL_TELEGRAM_MSG_ID
                 lock_str = str(rec.get(config.COL_TELEGRAM_MSG_ID, ""))
@@ -1173,6 +1338,7 @@ class PriceUpdateBot:
                             
                 self.pending_updates[f"{user_id}_{row_index}"] = {
                     'name': rec.get(config.COL_PRODUCT_NAME),
+                    'shop_product_name': rec.get(config.COL_SHOP_PRODUCT_NAME),
                     'suggestion': max(t_price - config.PRICE_DIFF_GOAL, p_cost),
                     'row_index': row_index,
                     'msg_map': msg_map
@@ -1208,21 +1374,21 @@ class PriceUpdateBot:
         if context.user_data.get('awaiting_interval'):
             try:
                 new_interval = int(update.message.text)
-                if new_interval < 10: raise ValueError("Too short")
+                if new_interval < 1: raise ValueError("Too short")
                 self.settings['scan_interval'] = new_interval
                 self._save_settings()
                 context.user_data['awaiting_interval'] = False
-                await update.message.reply_text(f"✅ سرعت اسکن به هر `{new_interval}` ثانیه تغییر کرد.")
+                await update.message.reply_text(f"✅ سرعت مانیتورینگ به هر `{new_interval}` دقیقه تغییر کرد.")
                 return
             except ValueError:
-                await update.message.reply_text("❌ لطفا عدد معتبر وارد کنید (حداقل ۱۰ ثانیه).")
+                await update.message.reply_text("❌ لطفا عدد معتبر وارد کنید (حداقل ۱ دقیقه).")
                 return
 
         # 2.5 Handle Auto Sync Change
         if context.user_data.get('awaiting_auto_sync'):
             try:
                 new_minutes = int(update.message.text)
-                self.settings['auto_sync_interval'] = new_minutes * 60
+                self.settings['auto_sync_interval'] = new_minutes
                 self._save_settings()
                 context.user_data['awaiting_auto_sync'] = False
                 status_text = f"✅ آپدیت خودکار ترب روی `{new_minutes}` دقیقه تنظیم شد." if new_minutes > 0 else "✅ آپدیت خودکار ترب غیرفعال شد."
@@ -1241,7 +1407,8 @@ class PriceUpdateBot:
             context.user_data['temp_admin_id'] = new_uid
             context.user_data['awaiting_admin_id'] = False
             context.user_data['awaiting_admin_name'] = True
-            await update.message.reply_text("✍️ حالا نام این ادمین را وارد کنید:")
+            msg = await update.message.reply_text("✍️ حالا نام این ادمین را وارد کنید:")
+            context.user_data['last_prompt_id'] = msg.message_id
             return
 
         # 4. Handle Admin Addition (Step 2: Name)

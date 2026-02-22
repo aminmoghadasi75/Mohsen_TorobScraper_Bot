@@ -76,9 +76,9 @@ class GoogleSheetsHandler:
                         # Extract number if it's a formula like =12000
                         if val.startswith('='):
                             val = val[1:]
-                        record[key] = int(float(val)) if val else 0
+                        record[key] = int(float(val)) if val else ""
                     except (ValueError, TypeError):
-                        record[key] = 0
+                        record[key] = ""
             records.append(record)
         return records
 
@@ -88,13 +88,15 @@ class GoogleSheetsHandler:
     def _update_cell_internal(self, row, col_name, value):
         col = self._find_column_index_internal(col_name) 
         if col:
-            self.sheet.update_cell(row, col, value, value_input_option="USER_ENTERED")
+            cell_range = gspread.utils.rowcol_to_a1(row, col)
+            self.sheet.update(cell_range, [[value]], value_input_option="USER_ENTERED")
         else:
             logging.error(f"Sheet Error: Column '{col_name}' not found!")
 
     def update_cell_by_index(self, row, col_idx, value):
         """Updates a cell using numeric column index (1-based)."""
-        return self._retry_on_failure(self.sheet.update_cell, row, col_idx, value, value_input_option="USER_ENTERED")
+        cell_range = gspread.utils.rowcol_to_a1(row, col_idx)
+        return self._retry_on_failure(self.sheet.update, cell_range, [[value]], value_input_option="USER_ENTERED")
 
     def find_column_index(self, column_name):
         return self._retry_on_failure(self._find_column_index_internal, column_name)
@@ -139,7 +141,73 @@ class GoogleSheetsHandler:
     def format_hyperlink(self, url, label):
         if not url:
             return ""
+        # The user requested specific double quote handling:
+        # =HYPERLINK("url", "label")
         return f'=HYPERLINK("{url}", "{label}")'
+
+    def apply_style(self, sheet=None):
+        """Applies premium styling: Vazirmatn font, RTL, 3-digit separator, and Green Table headers."""
+        target_sheet = sheet if sheet else self.sheet
+        try:
+            # 1. Global Font & RTL & Alignment
+            # We target a large range to ensure even future rows are styled if they inherit
+            max_rows = 1500
+            max_cols = len(config.SHEET_COLUMNS) + 2
+            end_col_letter = gspread.utils.rowcol_to_a1(1, max_cols)[:1] # e.g. 'K'
+            full_range = f"A1:{end_col_letter}{max_rows}"
+
+            # General Body Format
+            body_fmt = {
+                "textFormat": {"fontFamily": "Vazirmatn", "fontSize": 10},
+                "horizontalAlignment": "CENTER",
+                "verticalAlignment": "MIDDLE"
+            }
+            target_sheet.format(full_range, body_fmt)
+
+            # 2. Number Formatting (3-digit separator)
+            # Apply to numeric columns: Purchase Cost, Site Price, Torob Price, Second Torob Price
+            numeric_indices = []
+            for col_name in [config.COL_PURCHASE_COST, config.COL_SITE_PRICE, config.COL_TOROB_PRICE, config.COL_SECOND_TOROB_PRICE]:
+                idx = self._find_column_index_internal(col_name)
+                if idx: numeric_indices.append(idx)
+            
+            num_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
+            for idx in numeric_indices:
+                col_letter = gspread.utils.rowcol_to_a1(1, idx)[:1]
+                target_sheet.format(f"{col_letter}2:{col_letter}{max_rows}", num_fmt)
+
+            # 3. Header Style (Green Table Style - 🟢)
+            header_fmt = {
+                "backgroundColor": {"red": 0.18, "green": 0.49, "blue": 0.19}, # Dark Green
+                "textFormat": {"bold": True, "fontFamily": "Vazirmatn", "fontSize": 11, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                "horizontalAlignment": "CENTER"
+            }
+            target_sheet.format(f"A1:{end_col_letter}1", header_fmt)
+            
+            # 4. Freeze top row
+            target_sheet.freeze(rows=1)
+            
+            logging.info(f"Styled sheet: {target_sheet.title} with Vazirmatn and Green Table style.")
+        except Exception as q:
+            logging.error(f"Styling error: {q}")
+
+    def apply_vazir_font(self, sheet=None):
+        """Sets the font for the entire sheet to Vazirmatn."""
+        target_sheet = sheet if sheet else self.sheet
+        try:
+            # Set font to Vazirmatn and Right-to-Left alignment
+            fmt = {
+                "textFormat": {
+                    "fontFamily": "Vazirmatn",
+                    "fontSize": 10
+                },
+                "horizontalAlignment": "RIGHT"
+            }
+            # Max possible range
+            target_sheet.format("A1:Z1000", fmt)
+            logging.info(f"Applied Vazirmatn font to {target_sheet.title}")
+        except Exception as e:
+            logging.error(f"Error applying font: {e}")
 
     def color_row(self, row_index, color_rgb):
         """
@@ -148,7 +216,10 @@ class GoogleSheetsHandler:
         try:
             fmt = {
                 "backgroundColor": color_rgb,
-                "textFormat": {"bold": True}
+                "textFormat": {
+                    "bold": True,
+                    "fontFamily": "Vazirmatn" # Keep font during color change
+                }
             }
             # Determine range
             end_col_idx = len(config.SHEET_COLUMNS)
@@ -175,6 +246,10 @@ class GoogleSheetsHandler:
                 logging.info("Headers mismatch. Updating to: %s", required_headers)
                 # Overwrite first row with correct headers
                 self.sheet.update("A1", [required_headers])
+            
+            # Always ensure styling is correct
+            self.apply_style()
+            self.apply_style(self.log_sheet)
         except Exception as e:
             logging.error(f"Error ensuring headers: {e}")
             raise e

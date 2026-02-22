@@ -5,21 +5,23 @@ SPREADSHEET_ID = "1JkKeaRuOXabLs917EQu-TaJgXzSn7BSxtWsIVHoF62Y"
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
 
 # Column Names (New Structure)
-COL_PRODUCT_NAME = "نام محصول"
+COL_PRODUCT_NAME = "نام محصول در ترب"
+COL_SHOP_PRODUCT_NAME = "نام محصول در گریش مال"
 COL_PURCHASE_COST = "قیمت تمام شده خرید"
-COL_SITE_PRICE = "قیمت سایت"
+COL_SITE_PRICE = "قیمت گریش مال"
 COL_TOROB_PRICE = "قیمت ترب"
-COL_SHOP_NAME = "اسم فروشگاه"
+COL_SHOP_NAME = "اسم ارزانترین فروشگاه"
 COL_PRODUCT_URL = "لینک محصول"
 COL_IMAGE_URL = "عکس محصول"
 COL_TELEGRAM_MSG_ID = "ID پیام تلگرام" # New column to prevent duplicates
 COL_ADMIN_NAME = "نام ادمین"
 COL_SECOND_TOROB_PRICE = "قیمت دوم ترب"
-COL_SECOND_SHOP_NAME = "اسم فروشگاه دوم"
+COL_SECOND_SHOP_NAME = "اسم فروشگاه دوم ترب"
 
 # Order of columns
 SHEET_COLUMNS = [
     COL_PRODUCT_NAME,
+    COL_SHOP_PRODUCT_NAME,
     COL_PURCHASE_COST,
     COL_SITE_PRICE,
     COL_TOROB_PRICE,
@@ -60,7 +62,7 @@ LOGS_SHEET_NAME = "Logs"
 LOG_COL_ADMIN = "نام ادمین"
 LOG_COL_DATE = "تاریخ"
 LOG_COL_TIME = "ساعت"
-LOG_COL_PRODUCT = "نام محصول"
+LOG_COL_PRODUCT = "نام محصول در ترب"
 LOG_COL_OLD_PRICE = "قیمت قبلی"
 LOG_COL_NEW_PRICE = "قیمت جدید"
 

@@ -1,0 +1,9 @@
+gspread==6.2.1
+protobuf==6.33.5
+python-telegram-bot==22.6
+rich==14.3.2
+selenium==4.40.0
+selenium_stealth==1.0.6
+tldextract==5.3.1
+webdriver_manager==4.0.2
+jdatetime==5.2.0

@@ -20,6 +20,7 @@ async def scraping_loop():
 
     # Initialize
     sheets = GoogleSheetsHandler(config.CREDENTIALS_FILE, config.SPREADSHEET_ID)
+    sheets.ensure_headers(config.SHEET_COLUMNS)
     scraper = TorobScraper()
 
     # Shop URL to monitor
@@ -69,17 +70,18 @@ async def scraping_loop():
                 p = scraped_map[name]
                 current_record = records[row_idx - 2]
                 
-                # Column structure:
-                # [نام محصول, قیمت تمام شده خرید, قیمت سایت, قیمت ترب, اسم فروشگاه, لینک محصول, عکس محصول, ID پیام تلگرام]
                 updates = {
                     config.COL_PRODUCT_NAME: name,
+                    config.COL_SHOP_PRODUCT_NAME: p.get('shop_product_name', ""),
                     config.COL_PURCHASE_COST: current_record.get(config.COL_PURCHASE_COST, ""),
                     config.COL_SITE_PRICE: p.get('shop_site_price', ""), # Populating from shop page
                     config.COL_TOROB_PRICE: p['price'],
                     config.COL_SHOP_NAME: p['shop_name'],
                     config.COL_PRODUCT_URL: sheets.format_hyperlink(p['product_url'], "لینک محصول"),
                     config.COL_IMAGE_URL: sheets.format_hyperlink(p['image_url'], "عکس محصول"),
-                    config.COL_TELEGRAM_MSG_ID: current_record.get(config.COL_TELEGRAM_MSG_ID, "")
+                    config.COL_TELEGRAM_MSG_ID: current_record.get(config.COL_TELEGRAM_MSG_ID, ""),
+                    config.COL_SECOND_TOROB_PRICE: p.get('second_price', ""),
+                    config.COL_SECOND_SHOP_NAME: p.get('second_shop_name', "")
                 }
                 sheets.update_row(row_idx, updates)
                 console.print(f"  [green]✔ Updated:[/green] {name} (Torob: {p['price']} T | Site: {p.get('shop_site_price')} T)")
@@ -99,13 +101,16 @@ async def scraping_loop():
                 p = scraped_map[name]
                 new_record = {
                     config.COL_PRODUCT_NAME: name,
+                    config.COL_SHOP_PRODUCT_NAME: p.get('shop_product_name', ""),
                     config.COL_PURCHASE_COST: "", 
                     config.COL_SITE_PRICE: p.get('shop_site_price', ""),
                     config.COL_TOROB_PRICE: p['price'],
                     config.COL_SHOP_NAME: p['shop_name'],
                     config.COL_PRODUCT_URL: sheets.format_hyperlink(p['product_url'], "لینک محصول"),
                     config.COL_IMAGE_URL: sheets.format_hyperlink(p['image_url'], "عکس محصول"),
-                    config.COL_TELEGRAM_MSG_ID: "" 
+                    config.COL_TELEGRAM_MSG_ID: "",
+                    config.COL_SECOND_TOROB_PRICE: p.get('second_price', ""),
+                    config.COL_SECOND_SHOP_NAME: p.get('second_shop_name', "")
                 }
                 
                 # Use update_row with a specific index instead of append_row
