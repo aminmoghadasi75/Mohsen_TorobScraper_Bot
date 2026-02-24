@@ -94,12 +94,16 @@ class TorobScraper(BaseScraper):
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # Resource blocking via CDP (more aggressive for site speed)
+        # 🚀 AGGRESSIVE Resource blocking via CDP (maximum speed)
         driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": [
-            "*.png", "*.jpg", "*.jpeg", "*.gif", "*.woff", "*.woff2", "*.ttf", "*.svg",
-            "facebook.net", "google-analytics.com", "googletagmanager.com"
+            "*.png", "*.jpg", "*.jpeg", "*.gif", "*.woff", "*.woff2", "*.ttf", "*.svg", "*.css",
+            "*media*", "*ads*", "*analytics*", "facebook.net", "google-analytics.com", 
+            "googletagmanager.com", "yandex.ru", "hotjar.com", "clarity.ms"
         ]})
         driver.execute_cdp_cmd("Network.enable", {})
+        
+        driver.set_page_load_timeout(config.SCRAPE_TIMEOUT)
+        driver.set_script_timeout(config.SCRAPE_TIMEOUT)
 
         stealth(driver,
                 languages=["fa-IR", "fa", "en-US", "en"],
@@ -132,14 +136,16 @@ class TorobScraper(BaseScraper):
         self._load_cookies() # Load from file as backup
 
     def normalize_digits(self, text):
+        if not text: return "0"
         mapping = {
             '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
-            '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
-            '٫': '', ',': ''
+            '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9'
         }
         for k, v in mapping.items():
             text = text.replace(k, v)
-        return text
+        # Extract ALL digits from the string to handle separators like dots/commas
+        digits = re.sub(r'\D', '', text)
+        return digits if digits else "0"
 
     def search_product(self, product_name, retries=3):
         for attempt in range(retries):
@@ -202,10 +208,19 @@ class TorobScraper(BaseScraper):
 
             # Handle "All Iran" filter for best price
             try:
-                iran_badge = self.driver.find_element(By.XPATH, "//*[contains(text(), 'تمام ایران')]/ancestor::div[contains(@class, 'FilterButton_filterBadge')]")
-                self.driver.execute_script("arguments[0].click();", iran_badge)
-                time.sleep(1)
-            except: pass
+                # Optimized: More robust selector for 'All Iran' filter
+                iran_badge = self.driver.find_element(By.XPATH, "//h6[contains(text(), 'تمام ایران')]/ancestor::div[contains(@class, 'FilterButton_')] | //*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
+                badge_class = iran_badge.get_attribute("class").lower()
+                
+                # Check for 'active' in class (both camelCase and underscore suffix)
+                if "active" not in badge_class:
+                    print("🌍 Selecting 'All Iran' filter...")
+                    self.driver.execute_script("arguments[0].click();", iran_badge)
+                    time.sleep(2) 
+                else:
+                    print("🌍 'All Iran' filter is already active.")
+            except Exception as e:
+                print(f"🌍 Note: 'All Iran' filter not found or already applied.")
 
             # --- Seller Extraction with "Show More" handling ---
             def extract_sellers_data():
@@ -217,8 +232,13 @@ class TorobScraper(BaseScraper):
                 
                 for card in cards_list:
                     try:
-                        if "آگهی" in card.text: continue
-                        s_name = card.find_element(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']").text.strip()
+                        card_text = card.text
+                        if "آگهی" in card_text: continue
+                        
+                        # Shop Name
+                        s_name_el = card.find_elements(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']")
+                        if not s_name_el: continue
+                        s_name = s_name_el[0].text.strip()
                         
                         # Extract shop-specific product name if this is our shop
                         if s_name == config.MY_SHOP_NAME:
@@ -227,48 +247,107 @@ class TorobScraper(BaseScraper):
                                 local_shop_name = p_name_el.text.strip()
                             except: pass
 
-                        p_txt = card.find_element(By.CSS_SELECTOR, ".price, [class*='price']").text
-                        p_val = int(re.search(r'(\d+)', self.normalize_digits(p_txt)).group(1))
-                        try:
-                            b_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
-                        except:
-                            b_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
+                        # Robust Price Extraction: Prioritize elements that ONLY have 'price' but not 'report' or 'btn'
+                        price_el = None
+                        # Try exact class first
+                        exact_price = card.find_elements(By.CSS_SELECTOR, ".price")
+                        for ep in exact_price:
+                            if "تومان" in ep.text:
+                                price_el = ep
+                                break
+                        
+                        if not price_el:
+                            # Fallback to broader selector but exclude common non-price elements
+                            all_price_likes = card.find_elements(By.CSS_SELECTOR, "[class*='price']")
+                            for pl in all_price_likes:
+                                cl = pl.get_attribute("class").lower()
+                                if "price" in cl and "report" not in cl and "btn" not in cl and "تومان" in pl.text:
+                                    price_el = pl
+                                    break
+                        
+                        if not price_el:
+                            # Final fallback: Look for any element containing 'تومان'
+                            toman_els = card.find_elements(By.XPATH, ".//*[contains(text(), 'تومان')]")
+                            if toman_els: price_el = toman_els[0]
 
-                        found_sellers.append({'name': s_name, 'price': p_val, 'btn': b_btn})
-                    except: continue
+                        if price_el:
+                            p_txt = price_el.text
+                            p_val = int(self.normalize_digits(p_txt))
+                            if p_val == 0: continue # Skip if no digits found
+
+                            try:
+                                b_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
+                            except:
+                                b_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
+
+                            found_sellers.append({'name': s_name, 'price': p_val, 'btn': b_btn})
+                    except Exception as ex: 
+                        # print(f"DEBUG: Error in card extraction: {ex}")
+                        continue
                 return found_sellers, local_shop_name
 
             # Initial extraction
             sellers, shop_product_name = extract_sellers_data()
 
-            # If shop name not found or we need to ensure we see everyone, click "Show More"
-            try:
-                # Scroll to bottom to trigger button visibility
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(1)
-                
-                show_more = self.driver.find_elements(By.CSS_SELECTOR, ".show-more-btn, [class*='show-more-btn']")
-                if show_more:
-                    print(f"🔗 Clicking 'Show More Sellers' to find {config.MY_SHOP_NAME}...")
-                    self.driver.execute_script("arguments[0].click();", show_more[0])
-                    time.sleep(2)
-                    # Re-extract if we clicked
-                    sellers, shop_product_name = extract_sellers_data()
-            except Exception as e:
-                print(f"⚠️ Note: Could not expand sellers list: {e}")
+            # Optimization: Only expand if Gerishmall wasn't found in the first batch
+            if not shop_product_name:
+                try:
+                    # Scroll down to ensure the button is loadable
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    show_more_btns = self.driver.find_elements(By.CSS_SELECTOR, ".show-more-btn, [class*='show-more-btn']")
+                    if show_more_btns:
+                        print(f"🔗 Clicking 'Show More Sellers' to find {config.MY_SHOP_NAME}...")
+                        self.driver.execute_script("arguments[0].click();", show_more_btns[0])
+                        time.sleep(2)
+                        # Re-extract to find our shop name
+                        sellers, shop_product_name = extract_sellers_data()
+                except Exception as e:
+                    print(f"⚠️ Note: Could not expand sellers list: {e}")
 
             if not sellers:
                 return None
 
+            # Get summary price from "All Iran" badge as the absolute minimum reference
+            all_iran_summary_price = None
+            try:
+                badge = self.driver.find_element(By.XPATH, "//*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
+                # Price is usually in a sub-element or title attribute
+                badge_text = badge.text
+                if "تومان" in badge_text:
+                    all_iran_summary_price = int(self.normalize_digits(badge_text))
+                    print(f"💰 Found summary 'All Iran' price: {all_iran_summary_price:,} T")
+            except: pass
+
+            if not sellers:
+                # If no seller cards found, but we have the summary price, return at least that
+                if all_iran_summary_price:
+                    return {
+                        'price': all_iran_summary_price,
+                        'shop_name': "نامشخص (مراجعه به ترب)",
+                        'shop_product_name': shop_product_name,
+                        'second_price': None,
+                        'second_shop_name': None,
+                        'product_url': self.driver.current_url,
+                        'second_product_url': None,
+                        'image_url': image_url
+                    }
+                return None
+
             # Sort by price
             sellers.sort(key=lambda x: x['price'])
-            cheapest = sellers[0]
-            second_cheapest = sellers[1] if len(sellers) > 1 else None
+            
+            # If our found cheapest is higher than the summary badge, we might have missed the cheapest seller
+            if all_iran_summary_price and sellers[0]['price'] > all_iran_summary_price:
+                # We record the summary price as the cheapest, but keep the closest seller for name reference?
+                # Actually, better to insert a virtual "Cheapest" record
+                cheapest = {'name': "ارزان‌ترین فروشنده (در ترب مشاهده کنید)", 'price': all_iran_summary_price, 'btn': sellers[0]['btn']}
+                second_cheapest = sellers[0]
+            else:
+                cheapest = sellers[0]
+                second_cheapest = sellers[1] if len(sellers) > 1 else None
             
             # Skip the slow follow_redirect for speed
-            # final_url = self._follow_redirect(cheapest['btn'])
-            # second_final_url = self._follow_redirect(second_cheapest['btn']) if second_cheapest else None
-            # Just use the redirect URL directly or torob link
             final_url = cheapest['btn'].get_attribute("href") if cheapest.get('btn') else ""
             second_final_url = second_cheapest['btn'].get_attribute("href") if second_cheapest and second_cheapest.get('btn') else ""
 
@@ -421,11 +500,14 @@ class TorobScraper(BaseScraper):
         if self.driver:
             self.driver.quit()
 
-    def get_shop_products(self, shop_url, progress_callback=None, captcha_callback=None):
+    def get_shop_products(self, shop_url, progress_callback=None, captcha_callback=None, limit=None, name_map=None):
         """
         Scrapes all products with a callback for progress updates.
         Ensures all products (e.g., 39) are loaded via infinite scroll.
         """
+        if limit is None:
+            limit = config.TEST_MODE_LIMIT
+
         if captcha_callback:
             self.captcha_callback = captcha_callback
             
@@ -438,9 +520,16 @@ class TorobScraper(BaseScraper):
             max_scroll_retries = 5
             scroll_retry = 0
             
+            # If we have a small limit, we might not need to scroll much
             while True:
                 cards = self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']")
-                previous_count = len(cards)
+                current_count = len(cards)
+                
+                if limit and current_count >= limit:
+                    print(f"✅ Reached limit of {limit} products. Stopping scroll.")
+                    break
+
+                previous_count = current_count
                 print(f"📊 Current product count: {previous_count}")
                 
                 if previous_count > 0:
@@ -468,7 +557,8 @@ class TorobScraper(BaseScraper):
                         break
                 
                 # Check if new products loaded
-                current_count = len(self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']"))
+                new_cards = self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']")
+                current_count = len(new_cards)
                 print(f"📊 New product count: {current_count}")
                 
                 if current_count > previous_count:
@@ -484,7 +574,14 @@ class TorobScraper(BaseScraper):
                         continue
                     print("🏁 All products loaded.")
                     break
+            
             all_cards = self.driver.find_elements(By.CSS_SELECTOR, "a[href^='/p/']")
+            
+            # Apply limit if specified
+            if limit:
+                all_cards = all_cards[:limit]
+                print(f"✂️ Limited processing to {len(all_cards)} products.")
+
             product_links = []
             seen_urls = set()
             for card in all_cards:
@@ -495,18 +592,38 @@ class TorobScraper(BaseScraper):
                     title = card.find_element(By.TAG_NAME, "h2").text.strip()
                     try:
                         price_els = card.find_elements(By.XPATH, ".//*[contains(text(), 'تومان')]")
-                        shop_price = int(re.search(r'(\d+)', self.normalize_digits(price_els[-1].text)).group(1)) if price_els else 0
+                        shop_price = int(self.normalize_digits(price_els[-1].text)) if price_els else 0
                     except: shop_price = 0
-                    product_links.append({'name': title, 'url': url, 'shop_site_price': shop_price})
+                    existing_name = name_map.get(title) if name_map else None
+                    product_links.append({
+                        'name': title, 
+                        'url': url, 
+                        'shop_site_price': shop_price, 
+                        'existing_shop_name': existing_name
+                    })
                 except: continue
 
             if not product_links:
                 print("❌ No product links extracted. Scraper possibly blocked.")
                 return None
 
-            # --- PARALLEL PROCESSING ---
-            results = []
+            # --- OPTIMIZED PROCESSING ---
             total = len(product_links)
+            results = []
+            
+            # Optimization: If only 1 worker or very few products, use the EXISTING driver
+            # instead of initializing a new one (saves 20-30 seconds of startup time per instance)
+            if config.SCRAPER_WORKERS <= 1 or total <= 3:
+                print(f"🚀 Processing {total} products sequentially using main driver for speed...")
+                for i, item in enumerate(product_links):
+                    res = self.scrape_single_product_details(item)
+                    if res:
+                        results.append(res)
+                    if progress_callback:
+                        progress_callback(i + 1, total, item['name'])
+                return results
+
+            # Otherwise, use parallel workers for large batches
             completed_count = 0
             count_lock = threading.Lock()
 
@@ -514,12 +631,24 @@ class TorobScraper(BaseScraper):
                 nonlocal completed_count
                 worker_scraper = TorobScraper(captcha_callback=self.captcha_callback)
                 worker_results = []
+                processed_since_reset = 0
+                
                 try:
                     for item in chunk:
-                        res = worker_scraper.scrape_single_product_details(item)
+                        # --- MEMORY MANAGEMENT: Reset driver every N products ---
+                        if processed_since_reset >= config.DRIVER_RESET_COUNT:
+                            print(f"♻️ Resetting worker driver to free RAM after {processed_since_reset} products...")
+                            worker_scraper.close()
+                            worker_scraper = TorobScraper(captcha_callback=self.captcha_callback)
+                            processed_since_reset = 0
+
+                        existing_name = item.get('existing_shop_name')
+                        res = worker_scraper.scrape_single_product_details(item, existing_shop_name=existing_name)
+                        
                         if res:
                             worker_results.append(res)
                         
+                        processed_since_reset += 1
                         with count_lock:
                             completed_count += 1
                             if progress_callback:
@@ -529,7 +658,7 @@ class TorobScraper(BaseScraper):
                 return worker_results
 
             # Split tasks into chunks
-            num_workers = min(config.SCRAPER_WORKERS, total) if total > 0 else 1
+            num_workers = min(config.SCRAPER_WORKERS, total)
             chunks = [product_links[i::num_workers] for i in range(num_workers)]
             
             print(f"🚀 Starting parallel scrape for {total} products with {num_workers} workers...")
@@ -543,18 +672,27 @@ class TorobScraper(BaseScraper):
             print(f"Error extracting shop products: {e}")
             return None
 
-    def scrape_single_product_details(self, item, retries=3):
+    def scrape_single_product_details(self, item, retries=2, existing_shop_name=None):
         """Scrapes details for a single product. Extracted for parallel use."""
         attempts = 0
+        shop_product_name = existing_shop_name # Use existing name if available
+        
         while attempts < retries:
             try:
-                # 🛡 Human-like Jitter
-                time.sleep(random.uniform(0.5, 2.5))
+                # 🛡 Hard Timeout per product page
+                # We use a simple time check within the loop for better control
+                page_start_time = time.time()
+                
+                # 🛡 Minimal Jitter (Faster)
+                time.sleep(random.uniform(0.1, 0.4))
                 
                 self.driver.get(item['url'])
                 
                 if "captcha" in self.driver.current_url or "ربات" in self.driver.page_source:
                     self._handle_captcha(item['url'])
+                
+                if (time.time() - page_start_time) > config.SCRAPE_TIMEOUT:
+                    raise Exception("Page load Timeout")
                     
                 try: 
                     self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1, h2")))
@@ -577,10 +715,17 @@ class TorobScraper(BaseScraper):
 
                 # All Iran filter
                 try:
-                    badge = self.driver.find_element(By.XPATH, "//*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
-                    self.driver.execute_script("arguments[0].click();", badge)
-                    time.sleep(1)
-                except: pass
+                    # Optimized: More robust selector for 'All Iran' filter
+                    badge = self.driver.find_element(By.XPATH, "//h6[contains(text(), 'تمام ایران')]/ancestor::div[contains(@class, 'FilterButton_')] | //*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
+                    badge_class = badge.get_attribute("class").lower()
+                    if "active" not in badge_class:
+                        print("🌍 Selecting 'All Iran' filter...")
+                        self.driver.execute_script("arguments[0].click();", badge)
+                        time.sleep(1.5)
+                    else:
+                        print("🌍 'All Iran' filter is already active.")
+                except Exception as e:
+                    pass # Not critical for details page if already active or missing
 
                 # --- Seller Extraction with "Show More" handling ---
                 def extract_sellers_data():
@@ -592,8 +737,13 @@ class TorobScraper(BaseScraper):
                     
                     for card in cards_list:
                         try:
-                            if "آگهی" in card.text: continue
-                            s_name = card.find_element(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']").text.strip()
+                            card_text = card.text
+                            if "آگهی" in card_text: continue
+                            
+                            # Shop Name
+                            s_name_el = card.find_elements(By.CSS_SELECTOR, ".shop-name, [class*='shop-name']")
+                            if not s_name_el: continue
+                            s_name = s_name_el[0].text.strip()
                             
                             # Extract shop-specific product name if this is our shop
                             if s_name == config.MY_SHOP_NAME:
@@ -602,43 +752,89 @@ class TorobScraper(BaseScraper):
                                     local_shop_name = p_name_el.text.strip()
                                 except: pass
 
-                            p_txt = card.find_element(By.CSS_SELECTOR, ".price, [class*='price']").text
-                            p_val = int(re.search(r'(\d+)', self.normalize_digits(p_txt)).group(1))
-                            try: 
-                                b_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
-                            except: 
-                                b_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
-                            found_sellers.append({'name': s_name, 'price': p_val, 'btn': b_btn})
+                            # Robust Price Extraction
+                            price_el = None
+                            exact_price = card.find_elements(By.CSS_SELECTOR, ".price")
+                            for ep in exact_price:
+                                if "تومان" in ep.text:
+                                    price_el = ep
+                                    break
+                            
+                            if not price_el:
+                                all_price_likes = card.find_elements(By.CSS_SELECTOR, "[class*='price']")
+                                for pl in all_price_likes:
+                                    cl = pl.get_attribute("class").lower()
+                                    if "price" in cl and "report" not in cl and "btn" not in cl and "تومان" in pl.text:
+                                        price_el = pl
+                                        break
+                            
+                            if not price_el:
+                                toman_els = card.find_elements(By.XPATH, ".//*[contains(text(), 'تومان')]")
+                                if toman_els: price_el = toman_els[0]
+
+                            if price_el:
+                                p_txt = price_el.text
+                                p_val = int(self.normalize_digits(p_txt))
+                                if p_val == 0: continue
+
+                                try: 
+                                    b_btn = card.find_element(By.XPATH, ".//a[contains(@href, 'redirect')]")
+                                except: 
+                                    b_btn = card.find_element(By.CSS_SELECTOR, "a[href*='redirect']")
+                                found_sellers.append({'name': s_name, 'price': p_val, 'btn': b_btn})
                         except: continue
                     return found_sellers, local_shop_name
 
                 # Initial extraction
                 sellers, shop_product_name = extract_sellers_data()
 
-                # If shop name not found or we need to ensure we see everyone, click "Show More"
+                # Optimization: Only expand if Gerishmall wasn't found in the first batch 
+                # AND we don't already have an existing name from SMART_DISCOVERY
+                if not shop_product_name:
+                    if config.SMART_DISCOVERY and existing_shop_name:
+                        # We skip expansion but must ensure name is NOT empty
+                        shop_product_name = existing_shop_name
+                    else:
+                        try:
+                            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                            time.sleep(1)
+                            show_more_btns = self.driver.find_elements(By.CSS_SELECTOR, ".show-more-btn, [class*='show-more-btn']")
+                            if show_more_btns:
+                                console_log = f"🔗 Clicking 'Show More Sellers' to find {config.MY_SHOP_NAME}..."
+                                print(console_log)
+                                self.driver.execute_script("arguments[0].click();", show_more_btns[0])
+                                time.sleep(2)
+                                # Re-extract 
+                                sellers, shop_product_name = extract_sellers_data()
+                        except Exception as e:
+                            print(f"⚠️ Note: Could not expand sellers list: {e}")
+                
+                if not shop_product_name and existing_shop_name:
+                    shop_product_name = existing_shop_name
+
+                # Get summary price from "All Iran" badge as the absolute minimum reference
+                all_iran_summary_price = None
                 try:
-                    # Scroll to bottom to trigger button visibility
-                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(1)
-                    
-                    show_more = self.driver.find_elements(By.CSS_SELECTOR, ".show-more-btn, [class*='show-more-btn']")
-                    if show_more:
-                        print(f"🔗 Clicking 'Show More Sellers' to find {config.MY_SHOP_NAME}...")
-                        self.driver.execute_script("arguments[0].click();", show_more[0])
-                        time.sleep(2)
-                        # Re-extract
-                        sellers, shop_product_name = extract_sellers_data()
-                except Exception as e:
-                    print(f"⚠️ Note: Could not expand sellers list: {e}")
+                    badge = self.driver.find_element(By.XPATH, "//*[contains(text(), 'تمام ایران')]/ancestor::*[contains(@class, 'FilterButton_filterBadge')]")
+                    badge_text = badge.text
+                    if "تومان" in badge_text:
+                        all_iran_summary_price = int(self.normalize_digits(badge_text))
+                        # print(f"💰 Found summary 'All Iran' price: {all_iran_summary_price:,} T")
+                except: pass
 
                 if sellers:
+                    # Sort by price
                     sellers.sort(key=lambda x: x['price'])
-                    cheapest = sellers[0]
-                    second_cheapest = sellers[1] if len(sellers) > 1 else None
                     
-                    # Optimized: Skip the highly slow follow_redirect to significantly speed up processing
-                    # final_url = self._follow_redirect(cheapest['btn'])
-                    # second_final_url = self._follow_redirect(second_cheapest['btn']) if second_cheapest else None
+                    # Use summary price if it's lower (meaning we missed some sellers)
+                    if all_iran_summary_price and sellers[0]['price'] > all_iran_summary_price:
+                        cheapest = {'name': "ارزان‌ترین فروشنده (در ترب مشاهده کنید)", 'price': all_iran_summary_price, 'btn': sellers[0]['btn']}
+                        second_cheapest = sellers[0]
+                    else:
+                        cheapest = sellers[0]
+                        second_cheapest = sellers[1] if len(sellers) > 1 else None
+                    
+                    # Optimized URL extraction
                     final_url = cheapest['btn'].get_attribute("href") if cheapest.get('btn') else ""
                     second_final_url = second_cheapest['btn'].get_attribute("href") if second_cheapest and second_cheapest.get('btn') else ""
 
@@ -654,6 +850,21 @@ class TorobScraper(BaseScraper):
                         'second_product_url': second_final_url,
                         'image_url': image_url
                     }
+                else:
+                    # Fallback to summary price even if no cards found
+                    if all_iran_summary_price:
+                        return {
+                            'name': item['name'],
+                            'shop_product_name': shop_product_name,
+                            'shop_site_price': item['shop_site_price'],
+                            'price': all_iran_summary_price,
+                            'shop_name': "نامشخص (مراجعه به ترب)",
+                            'second_price': None,
+                            'second_shop_name': None,
+                            'product_url': self.driver.current_url,
+                            'second_product_url': None,
+                            'image_url': image_url
+                        }
                 return None
             except (WebDriverException, Exception) as de:
                 attempts += 1

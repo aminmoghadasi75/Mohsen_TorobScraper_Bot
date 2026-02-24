@@ -24,9 +24,10 @@ async def monitoring_job(bot_instance):
             console.print("[dim]Starting scheduled market scan...[/dim]")
             await bot_instance.run_monitoring_scan()
             
-            # Dynamic sleep based on settings
-            interval = bot_instance.settings.get('scan_interval', 60)
-            await asyncio.sleep(interval)
+            # Dynamic sleep based on settings (interval is in minutes)
+            interval = bot_instance.settings.get('scan_interval', 1)
+            sleep_time = max(15, interval * 60)
+            await asyncio.sleep(sleep_time)
         except asyncio.CancelledError:
             break
         except Exception as e:

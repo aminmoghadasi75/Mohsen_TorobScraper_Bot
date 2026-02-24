@@ -88,11 +88,14 @@ async def scraping_loop():
                 await asyncio.sleep(0.5)
 
             # 5. Perform Deletions (Bottom-to-Top to keep indices valid)
-            sorted_delete_indices = sorted([sheet_map[name] for name in to_delete], reverse=True)
-            for row_idx in sorted_delete_indices:
-                sheets.delete_row(row_idx)
-                console.print(f"  [red]✘ Deleted:[/red] Row {row_idx}")
-                await asyncio.sleep(0.5)
+            if config.TEST_MODE_LIMIT is None:
+                sorted_delete_indices = sorted([sheet_map[name] for name in to_delete], reverse=True)
+                for row_idx in sorted_delete_indices:
+                    sheets.delete_row(row_idx)
+                    console.print(f"  [red]✘ Deleted:[/red] Row {row_idx}")
+                    await asyncio.sleep(0.5)
+            else:
+                console.print(f"[yellow]⚠ Test Mode Active (Limit {config.TEST_MODE_LIMIT}): Skipping {len(to_delete)} deletions.[/yellow]")
 
             # 6. Perform Adds (Calculate row index manually to prevent overwriting)
             next_row_idx = len(records) + 2 # Header is 1, so data starts at 2. If records is 0, start at 2.

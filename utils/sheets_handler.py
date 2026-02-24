@@ -149,12 +149,19 @@ class GoogleSheetsHandler:
         """Applies premium styling: Vazirmatn font, RTL, 3-digit separator, and Green Table headers."""
         target_sheet = sheet if sheet else self.sheet
         try:
-            # 1. Global Font & RTL & Alignment
-            # We target a large range to ensure even future rows are styled if they inherit
-            max_rows = 1500
-            max_cols = len(config.SHEET_COLUMNS) + 2
-            end_col_letter = gspread.utils.rowcol_to_a1(1, max_cols)[:1] # e.g. 'K'
-            full_range = f"A1:{end_col_letter}{max_rows}"
+            # 1. Dynamically get sheet dimensions to avoid range errors
+            row_count = target_sheet.row_count
+            col_count = target_sheet.col_count
+            
+            # Ensure sheet is large enough for professional look (if it's the main sheet)
+            if target_sheet == self.sheet and row_count < 1500:
+                try:
+                    target_sheet.add_rows(1500 - row_count)
+                    row_count = 1500
+                except: pass
+
+            end_col_letter = gspread.utils.rowcol_to_a1(1, col_count).replace("1", "")
+            full_range = f"A1:{end_col_letter}{row_count}"
 
             # General Body Format
             body_fmt = {
@@ -165,16 +172,26 @@ class GoogleSheetsHandler:
             target_sheet.format(full_range, body_fmt)
 
             # 2. Number Formatting (3-digit separator)
-            # Apply to numeric columns: Purchase Cost, Site Price, Torob Price, Second Torob Price
+            # Apply to numeric columns only if they exist in this sheet
             numeric_indices = []
             for col_name in [config.COL_PURCHASE_COST, config.COL_SITE_PRICE, config.COL_TOROB_PRICE, config.COL_SECOND_TOROB_PRICE]:
-                idx = self._find_column_index_internal(col_name)
-                if idx: numeric_indices.append(idx)
+                # Only check main sheet for these specific columns
+                if target_sheet == self.sheet:
+                    idx = self._find_column_index_internal(col_name)
+                    if idx and idx <= col_count: numeric_indices.append(idx)
+                elif target_sheet == self.log_sheet:
+                    # For logs, old/new prices are in specific columns
+                    if col_name in [config.LOG_COL_OLD_PRICE, config.LOG_COL_NEW_PRICE]:
+                        try:
+                            headers = self.log_sheet.row_values(1)
+                            idx = headers.index(col_name) + 1
+                            if idx <= col_count: numeric_indices.append(idx)
+                        except: pass
             
             num_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
             for idx in numeric_indices:
-                col_letter = gspread.utils.rowcol_to_a1(1, idx)[:1]
-                target_sheet.format(f"{col_letter}2:{col_letter}{max_rows}", num_fmt)
+                col_letter = gspread.utils.rowcol_to_a1(1, idx).replace("1", "")
+                target_sheet.format(f"{col_letter}2:{col_letter}{row_count}", num_fmt)
 
             # 3. Header Style (Green Table Style - 🟢)
             header_fmt = {
@@ -185,7 +202,9 @@ class GoogleSheetsHandler:
             target_sheet.format(f"A1:{end_col_letter}1", header_fmt)
             
             # 4. Freeze top row
-            target_sheet.freeze(rows=1)
+            try:
+                target_sheet.freeze(rows=1)
+            except: pass
             
             logging.info(f"Styled sheet: {target_sheet.title} with Vazirmatn and Green Table style.")
         except Exception as q:

@@ -60,6 +60,7 @@ class PriceUpdateBot:
         
         # Tracking for small pinned status headers
         self._pinned_status_messages = {} # chat_id -> message_id
+        self._ui_update_times = {} # message_id -> timestamp
         
         # Start Background Scheduler for Scraper
         self.app.job_queue.run_repeating(self.background_scraper_task, interval=60) # Checks every minute if it's time
@@ -263,14 +264,36 @@ class PriceUpdateBot:
 
     async def menu_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_admin(update.effective_user.id): return
+        
+        shamsi_date = jdatetime.datetime.now().strftime("%Y/%m/%d")
+        
         help_text = (
-            "❓ **راهنمای جامع پنل مدیریت**\n\n"
-            "📊 **وضعیت فروشگاه :** گزارش در لحظه از قیمت‌های شیت و ترب.\n"
-            "♻️ **اسکن و بروزرسانی:** پاکسازی تمام قفل‌ها و شروع مانیتورینگ مجدد.\n"
-            "📦 **محصولات بحرانی:** کالاهایی که قیمت ترب‌شان به قیمت خرید شما نزدیک شده.\n"
-            "⚙️ **تنظیمات:** مدیریت فواصل قیمتی، اعلان‌ها و سرعت اسکن.\n"
-            "👥 **مدیریت دسترسی‌ها:** افزودن یا حذف دسترسی دیگران (فقط مدیر اصلی).\n\n"
-            "💡 _نکته: قیمت پیشنهادی همیشه ۱۰۰ هزار تومان ارزان‌تر از ترب است مگر اینکه از قیمت خرید کمتر شود._"
+            "� **راهنمای جامع دستیار هوشمند گریش‌مال**\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "این بات با هدف خودکارسازی فرآیند قیمت‌گذاری و حفظ رقابت‌پذیری شما در بازار ترب طراحی شده است. لطفا نکات زیر را با دقت مطالعه کنید:\n\n"
+            
+            "💡 **بهترین شیوه استفاده (استراتژی پیشنهادی):**\n"
+            "برای اینکه همیشه دقیق‌ترین قیمت‌ها را در سایت داشته باشید، این چرخه را دنبال کنید:\n\n"
+            "۱️⃣ **گام اول: آپدیت ترب 📥**\n"
+            "ابتدا روی دکمه «آپدیت ترب» کلیک کنید. بات با اسکن دقیق غرفه شما در ترب، آخرین قیمت‌های بازار و رقبا را یافته و در لیست قیمت‌های شما (گوگل‌شیت) قرار می‌دهد.\n\n"
+            "۲️⃣ **گام دوم: بررسی قیمت‌ها 🔍**\n"
+            "پس از پایان آپدیت، روی دکمه «بررسی مجدد قیمت‌ها» بزنید. بات با تحلیل هوشمند، محصولاتی که نیاز به اصلاح دارد را پیدا کرده و برای هر کدام یک کارت هشدار ارسال می‌کند.\n\n"
+            
+            "━━━━━━━━━━━━━━━━\n\n"
+            
+            "� **آشنایی با ابزارهای مدیریتی:**\n"
+            "• 📊 **وضعیت فروشگاه:** خلاصه آماری از تعداد کالاها و حاشیه سود فعلی.\n"
+            "• 📈 **گزارش حاشیه سود:** تحلیل دقیق سود هر کالا پس از کسر قیمت خرید.\n"
+            "• 💎 **محصولات انحصاری:** نمایش کالاهایی که فقط شما فروشنده آن‌ها هستید.\n"
+            "• 📦 **محصولات بحرانی:** کالاهایی که سود آن‌ها بسیار ناچیز شده و نیاز به بررسی دارند.\n\n"
+            
+            "⚙️ **قوانین قیمت‌گذاری هوشمند:**\n"
+            "• بات به صورت پیش‌فرض قیمت را **۱۰,۰۰۰ تومان ارزان‌تر** از رقیب اول پیشنهاد می‌دهد.\n"
+            "• **امنیت سرمایه:** قیمت پیشنهادی هرگز از «قیمت خرید» درج شده در شیت کمتر نخواهد شد.\n"
+            "• **تایید آنی:** با لمس دکمه «تایید»، قیمت محصول همان لحظه در سایت گریش‌مال آپدیت می‌شود.\n\n"
+            
+            "━━━━━━━━━━━━━━━━\n"
+            f"� آخرین بروزرسانی راهنما: `{shamsi_date}`"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -480,7 +503,9 @@ class PriceUpdateBot:
                 f"🆕 محصولات جدید: `{results['added']}`\n"
                 f"🔄 بروزرسانی شده: `{results['updated']}`\n"
                 f"📂 محصولات ابقا شده (آرشیو): `{results.get('kept', 0)}`\n\n"
-                f"⏱ کل زمان: `{int(time.time()-start_t)} ثانیه`"
+                f"⏱ کل زمان: `{int(time.time()-start_t)} ثانیه`\n"
+                "━━━━━━━━━━━━━━\n"
+                "💡 **پیشنهاد:** اکنون برای مشاهده محصولاتی که نیاز به تغییر قیمت دارند، دکمه **«🔍 بررسی مجدد قیمت‌ها»** را بزنید."
             )
             await msg.edit_text(summary, parse_mode='Markdown')
             await self._get_data(force_refresh=True) # Refresh cache after update
@@ -501,8 +526,10 @@ class PriceUpdateBot:
             """Sync callback from scraper thread to async Telegram UI."""
             percent = int((current / total) * 100)
             status_text = f"محصول {current} از {total}: {name[:20]}..."
+            # Use force=True for the final completion
+            is_finished = (current >= total)
             asyncio.run_coroutine_threadsafe(
-                self._update_progress(progress_msg, status_text, percent, start_t),
+                self._update_progress(progress_msg, status_text, percent, start_t, force=is_finished),
                 loop
             )
 
@@ -522,19 +549,25 @@ class PriceUpdateBot:
 
         try:
             if progress_msg:
-                asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, "در حال بررسی لیست ترب...", 5, start_t), loop)
+                asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, "در حال بررسی لیست ترب...", 5, start_t, force=True), loop)
             
-            # Execute scraper with callback
+            # --- SMART DISCOVERY: Get existing names to skip Show More later ---
+            records = await loop.run_in_executor(executor, self.sheets.get_all_records)
+            existing_names_map = {r.get(config.COL_PRODUCT_NAME): r.get(config.COL_SHOP_PRODUCT_NAME) for r in records if r.get(config.COL_PRODUCT_NAME)}
+
+            # Execute scraper with callback and existing name map
             shop_products = await loop.run_in_executor(
                 executor, 
                 scraper.get_shop_products, 
                 SHOP_URL, 
                 scraper_progress_callback if progress_msg else None,
-                scraper_captcha_callback if progress_msg else None
+                scraper_captcha_callback if progress_msg else None,
+                None, # limit (None means use Test Limit from config if active)
+                existing_names_map
             )
             
             if progress_msg:
-                asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, "بررسی دیتای شیت...", 90, start_t), loop)
+                asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, "بررسی دیتای شیت...", 90, start_t, force=True), loop)
             
             if shop_products is None:
                 if progress_msg:
@@ -610,7 +643,7 @@ class PriceUpdateBot:
                     if is_sole_seller:
                         red_rows.append(len(all_rows) + 1) # Already added to list, so adjust index
 
-            if progress_msg: await self._update_progress(progress_msg, "اعمال تغییرات روی گوگل‌شیت", 95, start_t)
+            if progress_msg: await self._update_progress(progress_msg, "اعمال تغییرات روی گوگل‌شیت", 95, start_t, force=True)
 
             # BATCH UPDATE: Overwrite the sheet data starting from row 2
             def batch_overwrite():
@@ -673,6 +706,11 @@ class PriceUpdateBot:
         
     async def run_monitoring_scan(self, progress_msg=None, start_t=None):
         """High-performance monitoring scan with batch sheet locking and progress reporting."""
+        # 🛡 LOCK MANAGEMENT: Yield to manual heavy operations
+        if self.manual_scraping_lock and self.lock_owner != "background":
+            logging.info("Monitoring scan deferred: Manual Sync is in progress.")
+            return {"total": 0, "alerts": 0}
+
         loop = asyncio.get_event_loop()
         records = await self._get_data(force_refresh=True)
         total = len(records)
@@ -688,10 +726,10 @@ class PriceUpdateBot:
             current_row = idx + 2
             product_name = record.get(config.COL_PRODUCT_NAME, "کالای بی نام")
             
-            if progress_msg and idx % 2 == 0: # Update every 2 products to avoid TG rate limits
+            if progress_msg and idx % 2 == 0: # Update every 2 products
                 percent = 20 + int((idx / total) * 75)
                 status = f"پایش محصول {idx+1} از {total}: {product_name[:15]}..."
-                asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, status, percent, start_t), loop)
+                asyncio.run_coroutine_threadsafe(self._update_progress(progress_msg, status, percent, start_t, force=False), loop)
 
             purchase_cost = int(record.get(config.COL_PURCHASE_COST) or 0)
             site_price = int(record.get(config.COL_SITE_PRICE) or 0)
@@ -835,8 +873,19 @@ class PriceUpdateBot:
         except Exception as e:
             logging.error(f"Pinned header error: {e}")
 
-    async def _update_progress(self, message, step_name, percent, start_time, error=False):
+    async def _update_progress(self, message, step_name, percent, start_time, error=False, force=False):
         """Premium UI: Updates a single message with progress bar. Also manages pinned header."""
+        # 🚀 UI THROTTLING: Avoid sending too many messages (Telegram Rate Limit)
+        now = time.time()
+        msg_id = message.message_id
+        last_update = self._ui_update_times.get(msg_id, 0)
+        
+        # Only update if forced (0% or 100%), if it's an error, or if enough time has passed
+        if not force and not error and percent > 0 and percent < 100:
+            if now - last_update < config.PROGRESS_UPDATE_INTERVAL:
+                return
+        
+        self._ui_update_times[msg_id] = now
         chat_id = message.chat.id
         finished = percent >= 100
         
